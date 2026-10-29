@@ -50,6 +50,48 @@ test('detectProfileDir 返回 profiles/web 路径', () => {
   assert.equal(detectProfileDir('/home/u/.dsh2', fs), null);
 });
 
+test('DSH profile bundle is never overwritten or removed by extension installation', () => {
+  const profile = '/home/u/.dsh/profiles/web';
+  const bridge = `${profile}/node_modules/dsh-vscode-bridge`;
+  const patch = `${BRIDGE_BEGIN_MARK}\n${BRIDGE_END_MARK}\n`;
+  const fs = makeMemFs({
+    [`${profile}/package.json`]: JSON.stringify({ dsh: { profile: { bundles: [BRIDGE_PACKAGE_NAME] } } }),
+    [`${profile}/cordis.patch.yml`]: patch,
+    [`${bridge}/package.json`]: JSON.stringify({ name: BRIDGE_PACKAGE_NAME, version: '0.3.2' }),
+    [`${bridge}/lib/client.js`]: 'managed bundle',
+    '/ext/package.json': JSON.stringify({ name: BRIDGE_PACKAGE_NAME, version: '0.3.2' }),
+    '/ext/lib/client.js': 'managed bundle',
+  });
+  fs.mkdir(profile);
+  const opts = { dshHome: '/home/u/.dsh', bridgeSourceDir: '/ext', fs };
+  assert.equal(installBridge(opts).status, 'ok');
+  fs.writeFile('/ext/lib/client.js', 'new extension');
+  assert.equal(installBridge(opts).status, 'degraded');
+  uninstallBridge(opts);
+  assert.equal(fs.readFile(`${bridge}/lib/client.js`), 'managed bundle');
+  assert.equal(fs.readFile(`${profile}/cordis.patch.yml`), patch);
+});
+
+test('unreadable profile ownership degrades installation and preserves the bridge', () => {
+  const profile = '/home/u/.dsh/profiles/web';
+  const bridge = `${profile}/node_modules/dsh-vscode-bridge`;
+  const patch = `${BRIDGE_BEGIN_MARK}\n${BRIDGE_END_MARK}\n`;
+  const fs = makeMemFs({
+    [`${profile}/package.json`]: '{',
+    [`${profile}/cordis.patch.yml`]: patch,
+    [`${bridge}/lib/client.js`]: 'managed bundle',
+  });
+  fs.mkdir(profile);
+  const opts = { dshHome: '/home/u/.dsh', bridgeSourceDir: '/ext', fs };
+  assert.equal(installBridge(opts).status, 'degraded');
+  uninstallBridge(opts);
+  assert.equal(fs.readFile(`${bridge}/lib/client.js`), 'managed bundle');
+  assert.equal(fs.readFile(`${profile}/cordis.patch.yml`), patch);
+  fs.readFile = () => { throw new Error('permission denied'); };
+  assert.equal(installBridge(opts).status, 'degraded');
+  assert.doesNotThrow(() => uninstallBridge(opts));
+});
+
 test('installBridge 幂等：第二次安装不重复追加条目', () => {
   const profile = '/home/u/.dsh/profiles/web';
   const patchPath = `${profile}/cordis.patch.yml`;

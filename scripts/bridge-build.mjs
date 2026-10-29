@@ -42,6 +42,9 @@ export function buildBridgeClient(opts) {
   const pkgRoot = dirname(dirname(coreSource));
   copyFileSync(join(pkgRoot, 'package.json'), join(outDir, 'package.json'));
   copyFileSync(join(pkgRoot, 'lib', 'index.js'), join(outLib, 'index.js'));
+  copyFileSync(join(pkgRoot, 'cordis.patch.yml'), join(outDir, 'cordis.patch.yml'));
+  copyFileSync(join(pkgRoot, 'README.md'), join(outDir, 'README.md'));
+  copyFileSync(join(pkgRoot, '..', 'LICENSE'), join(outDir, 'LICENSE'));
   console.log(`桥接客户端已构建到 ${outDir}/`);
   return outClient;
 }

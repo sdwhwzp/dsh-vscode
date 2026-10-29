@@ -47,6 +47,10 @@ test('buildBridgeClient 内联产物语法合法且不含 export/占位符残留
     // 顺带验证复制出的 package.json 与 index.js 存在（outDir 应为完整可安装包）
     assert.ok(existsSync(join(outDir, 'package.json')), '应复制出 package.json');
     assert.ok(existsSync(join(outDir, 'lib', 'index.js')), '应复制出 lib/index.js');
+    const manifest = JSON.parse(readFileSync(join(outDir, 'package.json'), 'utf8'));
+    const patch = readFileSync(join(outDir, manifest.dsh.bundle.patch), 'utf8');
+    assert.match(patch, /- insert:\s+- id: dsh-vscode-bridge\s+name: dsh-vscode-bridge/);
+    assert.match(readFileSync(join(outDir, 'LICENSE'), 'utf8'), /MIT License/);
   } finally {
     // 无论通过与否，都清理临时目录
     rmSync(outDir, { recursive: true, force: true });

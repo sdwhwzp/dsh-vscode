@@ -63,6 +63,15 @@ export function detectProfileDir(dshHome: string, fs: InstallerFs): string | nul
   return fs.exists(dir) ? dir : null;
 }
 
+/** Profile bundles are owned by the DSH package manager, including upgrades and removal. */
+function isProfileBundle(profileDir: string, fs: InstallerFs): boolean {
+  const manifestPath = join(profileDir, 'package.json');
+  if (!fs.exists(manifestPath)) return false;
+  const manifest = JSON.parse(fs.readFile(manifestPath));
+  return Array.isArray(manifest?.dsh?.profile?.bundles)
+    && manifest.dsh.profile.bundles.includes(BRIDGE_PACKAGE_NAME);
+}
+
 /**
  * 桥接包的全部安装目标目录。
  *
@@ -150,6 +159,18 @@ export function installBridge(opts: BridgeInstallOptions): BridgeInstallResult {
   // primary 路径保持兼容语义（BridgeInstallResult.bridgeDir）
   const bridgeDir = targets[0];
 
+  let profileBundle: boolean;
+  try {
+    profileBundle = isProfileBundle(profileDir, opts.fs);
+  } catch {
+    return { status: 'degraded', profileDir, bridgeDir, reason: 'Cannot read profile bundle ownership' };
+  }
+  if (profileBundle) {
+    const usable = isBridgeUsable(bridgeDir, opts.fs, bridgeVersion(opts.bridgeSourceDir, opts.fs), opts.bridgeSourceDir);
+    return { status: usable ? 'ok' : 'degraded', profileDir, bridgeDir,
+      ...(usable ? {} : { reason: 'DSH-managed bridge requires an update through the profile package manager' }) };
+  }
+
   // 读取现有 patch（不存在视为空，避免真实环境首次运行时 readFile 抛错）
   const existing = opts.fs.exists(patchPath) ? opts.fs.readFile(patchPath) : '';
 
@@ -210,6 +231,12 @@ function errMsg(e: unknown): string {
 export function uninstallBridge(opts: BridgeInstallOptions): void {
   const profileDir = detectProfileDir(opts.dshHome, opts.fs);
   if (profileDir === null) return;
+  try {
+    if (isProfileBundle(profileDir, opts.fs)) return;
+  } catch {
+    // Preserve the package when its ownership cannot be established.
+    return;
+  }
   const patchPath = join(profileDir, 'cordis.patch.yml');
   if (!opts.fs.exists(patchPath)) return;
   const patch = opts.fs.readFile(patchPath);
