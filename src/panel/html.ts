@@ -14,7 +14,7 @@ export type PanelMessage =
   | { type: 'copyUrl' }
   | { type: 'showLogs' }
   | { type: 'bridgeOpenExternal'; url: string }
-  | { type: 'bridgeOpenFile'; path: string; cwd?: string }
+  | { type: 'bridgeOpenFile'; path: string; cwd?: string; missReason?: string }
   | { type: 'bridgeCopyText'; text: string; requestId: string }
   | { type: 'bridgeReadText'; requestId: string }
   | { type: 'bridgeReadTextAck'; requestId: string; ok: boolean; text?: string }
@@ -59,6 +59,22 @@ button:hover { background: var(--vscode-button-hoverBackground); }
 .spinner { width: 28px; height: 28px; border: 3px solid var(--vscode-progressBar-background); border-top-color: transparent; border-radius: 50%; margin: 0 auto 12px; animation: spin 1s linear infinite; }
 @keyframes spin { to { transform: rotate(360deg); } }
 iframe.frame { position: fixed; inset: 0; width: 100%; height: 100%; border: none; }
+/* 面板缩放（issue #8，支持 0.5–1.5 两个方向）：用 transform: scale 缩放 iframe——
+   浏览器会把指针坐标自动逆变换回 iframe 的逻辑坐标系，因此点击位置依然准确。
+   关键点（均为真机几何实测得出）：
+   1) 容器必须“绝对定位”铺满可用区域；不要给 iframe 加 flex:1（flex 会固定 width，
+      与下面的百分比尺寸冲突，实测出现滚动条/内容不满）。
+   2) iframe 的逻辑尺寸按 1/zoom 放大、再用 scale(zoom) 还原，于是**物理尺寸恒等于容器**
+      —— 缩小与放大两个方向都能完美铺满（旧实现只在 ≤1 时成立，>1 会右/下落空）。
+   变量名刻意用 --dshv- 前缀，避免与页面里 iframe 元素的 id 子串互相干扰。 */
+.frame-zoom { position: absolute; inset: 0; }
+.frame-zoom > iframe.frame {
+  position: absolute; left: 0; top: 0; display: block; border: none;
+  width: calc(100% / var(--dshv-zoom, 1));
+  height: calc(100% / var(--dshv-zoom, 1));
+  transform: scale(var(--dshv-zoom, 1));
+  transform-origin: 0 0;
+}
 `;
 
 /** 按钮点击 → postMessage 的内联脚本（nonce 放行） */
@@ -163,7 +179,11 @@ if (iframeEl) {
     if (d && d.kind === 'openExternal' && typeof d.url === 'string') { vscode.postMessage({ type: 'bridgeOpenExternal', url: d.url }); return; }
     // 打开文件：转发给扩展 → showTextDocument（携带可选 cwd）
     if (d && d.kind === 'openFile' && typeof d.path === 'string') {
-      vscode.postMessage({ type: 'bridgeOpenFile', path: d.path, cwd: typeof d.cwd === 'string' ? d.cwd : undefined });
+      vscode.postMessage({
+        type: 'bridgeOpenFile', path: d.path,
+        cwd: typeof d.cwd === 'string' ? d.cwd : undefined,
+        missReason: typeof d.missReason === 'string' ? d.missReason : undefined,
+      });
       return;
     }
     // 复制文本：转发给扩展 → vscode.env.clipboard.writeText（跨源 iframe 原生剪贴板 API 被 VS Code 拦截）
@@ -347,17 +367,30 @@ export function stoppedPage(t: T, ctx: PageCtx): string {
  * writeText 转发给扩展宿主（vscode.env.clipboard）执行，才能真正写入系统剪贴板。
  * 桥接启用时注入握手脚本，让顶层 webview 与 DSH 页面 iframe 建立握手并转发跳转/剪贴板消息。
  * @param bridge 桥接配置（可选，向后兼容既有调用）：token 为握手凭据，enabled 为是否注入握手脚本
+ * @param contextBar 上下文工具条状态（可选，不传则不渲染工具条，向后兼容）
+ * @param zoomLevel 面板缩放（issue #8，可选，默认 1）；非 1 时用 CSS zoom 缩放 iframe，
+ *   并按比例放大 iframe 尺寸，使缩放后仍正好铺满容器（不产生横向滚动条）
  */
-export function readyPage(url: string, ctx: PageCtx, bridge?: { token: string; enabled: boolean; imageFallback?: boolean }): string {
+export function readyPage(
+  url: string,
+  ctx: PageCtx,
+  bridge?: { token: string; enabled: boolean; imageFallback?: boolean },
+  zoomLevel = 1,
+): string {
   // 桥接启用时注入握手脚本；未传入或 enabled=false 时保持向后兼容，不注入
   const extraScripts = bridge?.enabled
     ? `<script nonce="${ctx.nonce}">${bridgeHandshakeScript(bridge.token, new URL(url).origin, bridge.imageFallback === true)}</script>`
     : '';
+  // 缩放：只对非 1 的档位写入内联变量（1 时保持历史 DOM，零行为变化）
+  const zoomAttr =
+    zoomLevel !== undefined && zoomLevel !== 1
+      ? ` style="--dshv-zoom:${zoomLevel}"`
+      : '';
   return shell(
     ctx,
     'DSH',
     'frame-body',
-    `<iframe id="dsh-frame" class="frame" allow="clipboard-write" src="${url}"></iframe>`,
+    `<div class="frame-zoom"${zoomAttr}><iframe id="dsh-frame" class="frame" allow="clipboard-write" src="${url}"></iframe></div>`,
     extraScripts,
   );
 }

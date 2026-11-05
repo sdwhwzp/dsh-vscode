@@ -115,6 +115,8 @@ Visiting it returns `303` plus a signed session cookie (`HttpOnly; SameSite=Stri
 
 **If you start DSH yourself** (systemd, a terminal), the extension cannot read that process's log, so the panel shows a one-time **sign-in page**: paste the launch URL from the service log (e.g. `journalctl -u dsh -n 100`). One paste lasts up to 30 days, and a service restart does *not* require pasting again. You can also paste a bare `http://127.0.0.1:3080/` address — for a DSH ≤ 0.1.1 (no auth) service that is enough.
 
+**Context injection uses the same relay**: the file-context commands (`DSH: Add Current File to Context`, ask/send-selection, auto-follow) call DSH's `/api` through the local relay too, so they carry the session cookie and pass the browser-trust fence automatically; if the panel has not finished signing in yet, they wait up to 5 seconds before warning.
+
 **Exposure of the relay**: it listens on `127.0.0.1` only and holds a 30-day session, so any local process (including other local users) that finds the port can drive that session — the same exposure as a DSH ≤ 0.1.1 service listening on `127.0.0.1:3080` with no authentication at all, and narrower in practice (the port is random and must be scanned). 0.1.2's authentication protects against network exposure and cross-site browser contexts; the relay does not reintroduce network exposure.
 
 ## 🔗 Bridge integration
@@ -130,7 +132,7 @@ After installation, the extension installs its own bridge package `dsh-vscode-br
 
 To let the DSH page communicate with VS Code, the extension will:
 
-1. Install its bridge package `dsh-vscode-bridge` into your DSH user directory (`$DSH_HOME/profiles/web`, default `~/.dsh/profiles/web`) via DSH's official client-plugin extension point;
+1. Install its bridge package `dsh-vscode-bridge` into your DSH user directory (`$DSH_HOME/profiles/<dsh.profile>`, default `~/.dsh/profiles/web`) via DSH's official client-plugin extension point;
 2. Write a marked `insert:` entry (wrapped in `# dsh-vscode-bridge: begin` / `# dsh-vscode-bridge: end`) into `cordis.patch.yml`, registering the bridge as a DSH client plugin — writing only to the user directory and never touching the DSH installation directory.
 
 To remove, either way works:
@@ -171,6 +173,9 @@ The bridge only works inside the panel. If it is inactive (e.g. you open the DSH
 
 | Setting | Default | Description |
 |---|---|---|
+| `dsh.profile` | `web` | DSH profile used for startup and bridge installation (custom profiles must provide the web UI) |
+| `dsh.launchPreference` | `auto` | Which `dsh` install to prefer: `auto` (npm first, then DSH Desktop), `npm`, or `desktop`. If the preferred one is missing the other is used automatically; the log and the environment header record the actual source |
+| `dsh.desktopCommandPath` | (empty) | Absolute path of the DSH Desktop command (usually `%LOCALAPPDATA%\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd`); empty means auto-detect |
 | `dsh.port` | `3080` | Desired port (used for both detection and startup) |
 | `dsh.host` | `127.0.0.1` | Service address (loopback only) |
 | `dsh.autoStart` | `true` | Auto-start the service when it is not running |
@@ -180,6 +185,18 @@ The bridge only works inside the panel. If it is inactive (e.g. you open the DSH
 | `dsh.openInBrowser` | `false` | Open the DSH page in the default browser after the service starts (when off, `--no-open` is passed to `dsh web`) |
 | `dsh.remote.enabled` | `false` | Enable remote scenarios (SSH Remote / WSL / Dev Containers / Codespaces): run dsh on the remote and open the panel through a VS Code tunnel (off by default; reload the window after enabling) |
 | `dsh.image.fallback` | `true` | Send attached images as file-path references when the active model has no vision, instead of failing (files are cached in the session working directory and removed when the panel closes) |
+| `dsh.startTimeoutMs` | `45000` | How long to wait for `dsh web` to become ready, in milliseconds (5000–600000). Raise it on slow machines (Windows cold start measured at 17–23 s); this is the first knob to turn when the log says the service was not ready in time although it did start |
+| `dsh.env` | `{}` | Extra environment variables injected into the DSH child process (merged with the parent environment). Typical use on proxy networks: `{"NODE_OPTIONS":"--use-env-proxy"}` |
+| `dsh.useEnvProxy` | `false` | Append `--use-env-proxy` to the child process's `NODE_OPTIONS` (existing options are kept). Enable it when the model API is only reachable through an HTTP/HTTPS proxy |
+| `dsh.panel.zoomLevel` | `1` | Zoom of the embedded page: pick `0.5`–`1.5` from the dropdown (0.05 steps); finer values via `settings.json` |
+
+Set `"dsh.profile": "custom-profile"` and `"dsh.port": 3081` to launch
+`dsh --profile custom-profile --host 127.0.0.1 --port 3081 --no-open` and install
+the bridge into `$DSH_HOME/profiles/custom-profile`. Changing the profile restarts
+an extension-owned service; an existing external service is still reused by port.
+The default `web` profile preserves the current behavior.
+Profile names may contain ASCII letters, numbers, dots, underscores and hyphens;
+they cannot start with a hyphen or be `.` or `..`. Surrounding whitespace is trimmed.
 
 ## 🌍 Localization
 
@@ -191,7 +208,7 @@ Requirements: Node.js ≥ 22, VS Code ≥ 1.91.
 
 ```bash
 npm install
-npm run test          # 161 unit/integration tests (including a full real dsh web flow)
+npm run test          # 320 unit/integration tests (including real dsh web flows: service lifecycle, auth session)
 npm run compile       # builds out/extension.js
 npm run watch         # watch build
 npm run typecheck     # type check
@@ -235,6 +252,36 @@ This is a DeepSeek Harness community plugin (topic: [`dsh-plugin`](https://githu
 - DSH official repo: <https://github.com/deepseek-ai/deepseek-harness>
 - Issue tracker: <https://github.com/Fengze233/dsh-vscode/issues>
 - DSH community discussions: <https://github.com/deepseek-ai/deepseek-harness/discussions>
+
+## 🙏 Contributors & Acknowledgements
+
+Many improvements here came from the community. Contributions are grouped by type (IDs link to the corresponding issue/PR in this repository):
+
+### Code contributions
+
+| Contributor | Contribution | Ref |
+|---|---|---|
+| (none yet) | No community code contributions are merged in the current release | — |
+
+### Issue reports
+
+| Reporter | Report | Ref |
+|---|---|---|
+| [@AAAwoshi](https://github.com/AAAwoshi) | Panel reloading wholesale on every active-editor switch: traced it to the redundant `render()` inside `refreshContextBar()` plus a regenerated nonce per render, with sampled log evidence, a minimal patch and post-patch measurements | #27 |
+| [@Joshuayang228](https://github.com/Joshuayang228) | File clicks not forwarded to the editor: pinpointed the CSS Module hashed class name and provided full reproduction evidence and a fix sketch | #22 |
+| [@lizhuoyuan41-droid](https://github.com/lizhuoyuan41-droid) | Bridge package written into DSH Desktop's private command directory, breaking desktop startup: root cause plus an allow-list suggestion | #20 |
+| [@Minelenbolan](https://github.com/Minelenbolan) | Duplicate bridge entry in `cordis.patch.yml` crashing the plugin tree | #19 |
+| [@HafenYin](https://github.com/HafenYin) | Windows cold start exceeding the hard-coded 15 s timeout (with full startup log) | #23 |
+| [@NOIPJohnny](https://github.com/NOIPJohnny) | DSH unable to reach the model API behind a proxy; suggested injecting child-process environment variables | #18 |
+| [@ThinBuffalo](https://github.com/ThinBuffalo) | Request for zoom control of the embedded page | #8 |
+| [@smallshieh](https://github.com/smallshieh) | Request for editor context injection (send the active file/selection with a message) | #10 |
+| [@Tsechiyuan](https://github.com/Tsechiyuan) | Request to send the current selection straight into the conversation | #7 |
+| [@sseryling](https://github.com/sseryling) | WSL Remote blank panel and bridge handshake failure: provided measured fixes | #13 |
+| [@Zanford](https://github.com/Zanford) | DSH failing to start from VS Code | #12 |
+
+### Upstream
+
+- The narrow-viewport CJK caret issue (#9) was traced to the DSH frontend composer (the older "visible glyph backdrop + transparent textarea" dual-metric implementation). Upstream has since rewritten it as a Lexical editor, so the issue was closed with that conclusion.
 
 ## 📄 License
 

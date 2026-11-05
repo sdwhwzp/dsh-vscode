@@ -29,6 +29,8 @@ export interface PanelProviderUiOpts {
   frameBaseOverride?: () => string | null;
   /** 「需要登录」页提交启动网址的回调（扩展校验并兑换） */
   onAuthUrlSubmit?: (url: string) => void;
+  /** 面板缩放 getter（dsh.panel.zoomLevel，issue #8；缺省 1 = 不缩放） */
+  zoomLevel?: () => number;
 }
 
 export class DshPanelProvider implements vscode.WebviewViewProvider {
@@ -173,9 +175,12 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
   private bridgeDeps(): Parameters<typeof handleBridgeMessage>[1] {
     return {
       openExternal: (u) => vscode.env.openExternal(vscode.Uri.parse(u)),
-      // showTextDocument 返回 TextEditor，而依赖约定返回 Thenable<void>：用 async 包装丢弃返回值
+      // 用 vscode.open 而不是 window.showTextDocument：后者只能开文本编辑器，
+      // 点图片/PDF 会抛「File seems to be binary and cannot be opened as text」（issue #33）。
+      // vscode.open 由 VS Code 自选编辑器：文本→文本编辑器、图片→图片预览、PDF→内建 PDF 预览、
+      // 未知二进制→占位页（提示而非报错）。依赖契约仍为 Thenable<void>，故不返回其执行结果。
       openTextDocument: async (p) => {
-        await vscode.window.showTextDocument(vscode.Uri.file(p), { preview: false });
+        await vscode.commands.executeCommand('vscode.open', vscode.Uri.file(p), { preview: false });
       },
       // 用户提示统一走 vscode.window.showWarningMessage（host 层不 import vscode，保持纯逻辑可单测）
       showWarning: (m) => void vscode.window.showWarningMessage(m),
@@ -307,11 +312,17 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
           // 旧地址」的不同步白屏（issue #13-2：frameHosts 原先有两处互相覆盖的构造）。
           const frameUrl = this.pendingExternalUrl ?? s.url ?? this.rawUrl();
           ctx.frameHosts = [new URL(frameUrl).origin];
-          html = readyPage(frameUrl, ctx, {
-            token: this.bridgeToken,
-            enabled: this.bridgeEnabled(), // 由 dsh.bridge.enabled 配置驱动（Task 7 接入）
-            imageFallback: this.imageFallback(), // v0.3.0：降级开关随握手消息带给桥接客户端
-          });
+          html = readyPage(
+            frameUrl,
+            ctx,
+            {
+              token: this.bridgeToken,
+              enabled: this.bridgeEnabled(), // 由 dsh.bridge.enabled 配置驱动（Task 7 接入）
+              imageFallback: this.imageFallback(), // v0.3.0：降级开关随握手消息带给桥接客户端
+            },
+            // 面板缩放（issue #8）：未接线时 1（不缩放）
+            this.ui.zoomLevel?.() ?? 1,
+          );
           break;
         }
         case 'failed':
@@ -326,5 +337,17 @@ export class DshPanelProvider implements vscode.WebviewViewProvider {
       }
     }
     v.webview.html = html;
+  }
+
+  /**
+   * 刷新面板占位页/工具条状态：按当前配置重渲染 ready 页。
+   *
+   * 由扩展入口在配置变更时调用：缩放档位（dsh.panel.zoomLevel）等"渲染期读取"的设置项
+   * 依赖这个入口重渲染，否则改设置后必须重载窗口才生效（自审时发现的缺陷）。
+   * 注意：**不能**提前返回——未打开面板时只跳过渲染动作，由 render 自身判空。
+   */
+  refreshContextBar(): void {
+    if (!this.view) return;
+    this.render();
   }
 }

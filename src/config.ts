@@ -2,9 +2,16 @@
 // 纯函数（normalizeConfig / isLoopbackHost）不依赖 vscode，可直接单测；
 // readConfig 是 vscode 设置的薄封装，供 extension.ts 使用。
 import * as vscode from 'vscode';
+// profile 名称规则放在无 vscode 依赖的模块里（卸载钩子也要用同一份，见 src/uninstall.ts）
+import { PROFILE_NAME_PATTERN } from './bridge/profile-name';
 
 /** 用户可配置的原始值（可能缺失/非法） */
 export interface RawDshConfig {
+  profile?: string;
+  /** 首选启动来源（dsh.launchPreference：auto/npm/desktop；非法值回退 auto） */
+  launchPreference?: string;
+  /** 桌面端命令绝对路径（dsh.desktopCommandPath；空串 = 自动探测默认位置） */
+  desktopCommandPath?: string;
   host?: string;
   port?: number;
   autoStart?: boolean;
@@ -24,10 +31,23 @@ export interface RawDshConfig {
   remoteEnabled?: boolean;
   /** 模型无视觉能力时是否自动把图片降级为文本+路径转发（默认开启） */
   imageFallback?: boolean;
+  /** 等待 dsh web 就绪的总超时毫秒（dsh.startTimeoutMs） */
+  startTimeoutMs?: number;
+  /** 注入 DSH 子进程的额外环境变量（dsh.env） */
+  env?: Record<string, string>;
+  /** 是否自动为子进程追加 Node 的 --use-env-proxy（dsh.useEnvProxy） */
+  useEnvProxy?: boolean;
+  /** 面板内网页缩放档位（dsh.panel.zoomLevel，issue #8） */
+  panelZoomLevel?: number;
 }
 
 /** 规范化后的配置（均有合法默认值） */
 export interface DshConfig {
+  profile: string;
+  /** 首选启动来源（v0.4.3：auto = npm 优先，没有再桌面端） */
+  launchPreference: LaunchPreference;
+  /** 桌面端命令绝对路径（空串 = 按平台默认位置自动探测） */
+  desktopCommandPath: string;
   host: string;
   port: number;
   autoStart: boolean;
@@ -47,10 +67,21 @@ export interface DshConfig {
   remoteEnabled: boolean;
   /** 非视觉模型下发图自动降级为文本+路径转发 */
   imageFallback: boolean;
+  /** 等待 dsh web 就绪的总超时毫秒（dsh.startTimeoutMs） */
+  startTimeoutMs: number;
+  /** 注入 DSH 子进程的额外环境变量（dsh.env；未配置为空对象） */
+  env: Record<string, string>;
+  /** 是否自动为子进程追加 --use-env-proxy（dsh.useEnvProxy） */
+  useEnvProxy: boolean;
+  /** 面板内网页缩放档位（dsh.panel.zoomLevel） */
+  panelZoomLevel: number;
 }
 
 /** 默认配置 */
 export const DEFAULTS: DshConfig = {
+  profile: 'web',
+  launchPreference: 'auto',
+  desktopCommandPath: '',
   host: '127.0.0.1',
   port: 3080,
   autoStart: true,
@@ -63,7 +94,36 @@ export const DEFAULTS: DshConfig = {
   openInBrowser: false,
   remoteEnabled: false,
   imageFallback: true,
+  // 启动总超时：默认 45s。Windows 冷启动（插件多、磁盘慢）实测可达 17–23s，
+  // 旧的 15s 硬编码会让服务其实已起来却报「未就绪」（issue #23）。
+  startTimeoutMs: 45000,
+  // 子进程额外环境变量：默认空（保持原有的"直接继承父进程环境"行为）
+  env: {},
+  // 是否自动追加 --use-env-proxy：默认关，避免改变任何现有用户的行为（issue #18）
+  useEnvProxy: false,
+  // 面板缩放：默认 1（= 当前行为，零变化）
+  panelZoomLevel: 1,
 };
+
+/** 面板缩放允许的范围（issue #8）：0.5–1.5 之间的任意数值都接受，用于"自定义缩放"。
+ *  下面的档位只作为设置 UI 的下拉候选。上下限经真机几何实测：区间内缩放后 iframe 物理尺寸
+ *  恰好覆盖面板可用区域（无留白、无滚动条、点击命中准确）。 */
+export const MIN_PANEL_ZOOM = 0.5;
+export const MAX_PANEL_ZOOM = 1.5;
+/** 设置 UI 的推荐档位（含自定义输入） */
+export const PANEL_ZOOM_LEVELS = [0.5, 0.6, 0.7, 0.8, 0.9, 1, 1.1, 1.25, 1.5] as const;
+
+/** 启动超时允许的下限（毫秒）：低于 5s 对真实 DSH 冷启动没有意义 */
+export const MIN_START_TIMEOUT_MS = 5000;
+/** 启动超时允许的上限（毫秒）：超过 10 分钟视为配置错误 */
+export const MAX_START_TIMEOUT_MS = 600000;
+
+// 对外仍从 config 导出该正则（package.test.ts 与 package.json 的 pattern 守卫依赖它）
+export { PROFILE_NAME_PATTERN };
+
+/** 首选启动来源取值（与 src/service/launcher.ts 的 LaunchPreference 一致） */
+export const LAUNCH_PREFERENCES = ['auto', 'npm', 'desktop'] as const;
+export type LaunchPreference = (typeof LAUNCH_PREFERENCES)[number];
 
 /** 安全边界：仅允许回环地址 */
 const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost', '[::1]']);
@@ -79,6 +139,46 @@ export function isLoopbackHost(host: string): boolean {
  */
 export function normalizeConfig(raw: RawDshConfig): { config: DshConfig; errors: string[] } {
   const errors: string[] = [];
+
+  // profile 必须是 DSH_HOME/profiles 下的目录名，不能是路径。
+  let profile = typeof raw.profile === 'string' ? raw.profile.trim() : raw.profile ?? DEFAULTS.profile;
+  if (typeof profile !== 'string' || !PROFILE_NAME_PATTERN.test(profile)) {
+    errors.push(`dsh.profile must be a valid profile name (letters, numbers, dots, underscores, hyphens; no leading hyphen), got ${JSON.stringify(raw.profile)}`);
+    profile = DEFAULTS.profile;
+  }
+
+  // launchPreference（dsh.launchPreference）：只接受三个枚举值，非法值记错误并回退 auto
+  let launchPreference: LaunchPreference;
+  if (raw.launchPreference === undefined) {
+    launchPreference = DEFAULTS.launchPreference;
+  } else if (!LAUNCH_PREFERENCES.includes(raw.launchPreference as LaunchPreference)) {
+    errors.push(
+      `dsh.launchPreference must be one of ${LAUNCH_PREFERENCES.join(' / ')}, got ${JSON.stringify(raw.launchPreference)}`,
+    );
+    launchPreference = DEFAULTS.launchPreference;
+  } else {
+    launchPreference = raw.launchPreference as LaunchPreference;
+  }
+
+  // desktopCommandPath（dsh.desktopCommandPath）：空串合法（= 自动探测）；非字符串静默回退默认；
+  // 提供了字符串但不是绝对路径 → 记错误并视为空（避免把相对路径交给 spawn）。
+  // 判定同时接受 Windows 盘符（C:\…/C:/…）与 POSIX（/…）形态：该设置只对 Windows 生效，
+  // 但配置文件可能在多平台间同步，不能因为平台不同就把合法值判成非法。
+  const DESKTOP_COMMAND_ABSOLUTE = /^(?:[A-Za-z]:[\\/]|\/)/;
+  let desktopCommandPath: string;
+  if (typeof raw.desktopCommandPath !== 'string') {
+    desktopCommandPath = DEFAULTS.desktopCommandPath;
+  } else {
+    const trimmed = raw.desktopCommandPath.trim();
+    if (trimmed === '') {
+      desktopCommandPath = '';
+    } else if (!DESKTOP_COMMAND_ABSOLUTE.test(trimmed)) {
+      errors.push(`dsh.desktopCommandPath must be an absolute path, got ${JSON.stringify(raw.desktopCommandPath)}`);
+      desktopCommandPath = '';
+    } else {
+      desktopCommandPath = trimmed;
+    }
+  }
 
   // 缺失与非法需区分：字段未配置时静默回退默认（不算错误），
   // 只有提供了非法值才记录错误并回退默认。
@@ -134,19 +234,103 @@ export function normalizeConfig(raw: RawDshConfig): { config: DshConfig; errors:
   const remoteEnabled = typeof raw.remoteEnabled === 'boolean' ? raw.remoteEnabled : DEFAULTS.remoteEnabled;
   const imageFallback = typeof raw.imageFallback === 'boolean' ? raw.imageFallback : DEFAULTS.imageFallback;
 
+  // startTimeoutMs：5000..600000 整数，非法回退默认并记录错误（issue #23）
+  let startTimeoutMs: number;
+  if (raw.startTimeoutMs === undefined) {
+    startTimeoutMs = DEFAULTS.startTimeoutMs;
+  } else if (
+    typeof raw.startTimeoutMs !== 'number' ||
+    !Number.isInteger(raw.startTimeoutMs) ||
+    raw.startTimeoutMs < MIN_START_TIMEOUT_MS ||
+    raw.startTimeoutMs > MAX_START_TIMEOUT_MS
+  ) {
+    errors.push(
+      `dsh.startTimeoutMs must be an integer in ${MIN_START_TIMEOUT_MS}..${MAX_START_TIMEOUT_MS}, got ${JSON.stringify(raw.startTimeoutMs)}`,
+    );
+    startTimeoutMs = DEFAULTS.startTimeoutMs;
+  } else {
+    startTimeoutMs = raw.startTimeoutMs;
+  }
+
+  // env（dsh.env）：只接受「键与值都是非空字符串」的条目；非法条目跳过并记录错误。
+  // 键名不得含 '=' 或 NUL（Node 对 env 键的要求），否则 spawn 行为未定义。
+  const env: Record<string, string> = {};
+  if (raw.env !== undefined) {
+    if (typeof raw.env !== 'object' || raw.env === null || Array.isArray(raw.env)) {
+      errors.push(`dsh.env must be an object of string values, got ${JSON.stringify(raw.env)}`);
+    } else {
+      for (const [k, v] of Object.entries(raw.env)) {
+        if (k === '' || k.includes('=') || k.includes('\0') || typeof v !== 'string') {
+          errors.push(`dsh.env entry ignored (key/value must be non-empty strings): ${JSON.stringify(k)}`);
+          continue;
+        }
+        env[k] = v;
+      }
+    }
+  }
+
+  // useEnvProxy（dsh.useEnvProxy）：布尔设置沿用既有缺省处理（非法静默回退）
+  const useEnvProxy = typeof raw.useEnvProxy === 'boolean' ? raw.useEnvProxy : DEFAULTS.useEnvProxy;
+
+  // panelZoomLevel（dsh.panel.zoomLevel）：接受 0.5–1.5 的任意数值（支持自定义缩放，
+  // 例如 1.15）；越界或非数字回退默认并记录错误（手改 settings.json 可能写入脏值）
+  let panelZoomLevel: number;
+  if (raw.panelZoomLevel === undefined) {
+    panelZoomLevel = DEFAULTS.panelZoomLevel;
+  } else if (
+    typeof raw.panelZoomLevel !== 'number' ||
+    !Number.isFinite(raw.panelZoomLevel) ||
+    raw.panelZoomLevel < MIN_PANEL_ZOOM ||
+    raw.panelZoomLevel > MAX_PANEL_ZOOM
+  ) {
+    errors.push(
+      `dsh.panel.zoomLevel must be a number in ${MIN_PANEL_ZOOM}..${MAX_PANEL_ZOOM}, got ${JSON.stringify(raw.panelZoomLevel)}`,
+    );
+    panelZoomLevel = DEFAULTS.panelZoomLevel;
+  } else {
+    panelZoomLevel = raw.panelZoomLevel;
+  }
+
   return {
     config: {
+      profile, launchPreference, desktopCommandPath,
       host, port, autoStart, stopOnExit, extraArgs, bridgeEnabled, workspaceRootIndex,
       silenceWarning, executablePath, openInBrowser, remoteEnabled, imageFallback,
+      startTimeoutMs, env, useEnvProxy, panelZoomLevel,
     },
     errors,
   };
+}
+
+/**
+ * 计算注入 DSH 子进程的最终环境变量（纯函数，便于单测）。
+ *
+ * 语义（issue #18）：
+ * - 以 dsh.env 为基础；
+ * - useEnvProxy=true 时确保 NODE_OPTIONS 含 `--use-env-proxy`（Node 原生 fetch 才会读
+ *   HTTP(S)_PROXY；实测不带该参数时环境变量被完全忽略），已存在则不重复追加、也不覆盖
+ *   用户原有的其它 NODE_OPTIONS 选项。
+ */
+export function buildChildEnv(
+  env: Record<string, string>,
+  useEnvProxy: boolean,
+): Record<string, string> {
+  const out: Record<string, string> = { ...env };
+  if (!useEnvProxy) return out;
+  const flag = '--use-env-proxy';
+  const existing = (out.NODE_OPTIONS ?? '').trim();
+  if (existing.split(/\s+/).includes(flag)) return out;
+  out.NODE_OPTIONS = existing === '' ? flag : `${existing} ${flag}`;
+  return out;
 }
 
 /** 从 VS Code 设置读取（薄封装，供 extension.ts 使用） */
 export function readConfig(): { config: DshConfig; errors: string[] } {
   const ws = vscode.workspace.getConfiguration('dsh');
   return normalizeConfig({
+    profile: ws.get<string>('profile'),
+    launchPreference: ws.get<string>('launchPreference'),
+    desktopCommandPath: ws.get<string>('desktopCommandPath'),
     host: ws.get<string>('host'),
     port: ws.get<number>('port'),
     autoStart: ws.get<boolean>('autoStart'),
@@ -159,5 +343,9 @@ export function readConfig(): { config: DshConfig; errors: string[] } {
     openInBrowser: ws.get<boolean>('openInBrowser'),
     remoteEnabled: ws.get<boolean>('remote.enabled'),
     imageFallback: ws.get<boolean>('image.fallback'),
+    startTimeoutMs: ws.get<number>('startTimeoutMs'),
+    env: ws.get<Record<string, string>>('env'),
+    useEnvProxy: ws.get<boolean>('useEnvProxy'),
+    panelZoomLevel: ws.get<number>('panel.zoomLevel'),
   });
 }

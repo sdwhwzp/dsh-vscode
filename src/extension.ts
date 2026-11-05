@@ -4,9 +4,10 @@ import { homedir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { readFileSync } from 'node:fs';
 import { initI18n, t } from './i18n';
-import { readConfig, type DshConfig } from './config';
+import { readConfig, buildChildEnv, type DshConfig } from './config';
 import { probeService } from './service/detect';
 import { createProcessRunner, findInPath, findInPathPosix, resolveDshPackageJsonPath } from './service/process';
+import { desktopRootFromShim } from './service/launcher';
 import { ServiceManager, type ManagerOptions } from './service/manager';
 import { DshPanelProvider } from './panel/provider';
 import { StatusBarController } from './statusbar';
@@ -26,6 +27,7 @@ import {
   installBridge,
   uninstallBridge,
   createNodeFs,
+  npmNodeModulesRootFrom,
   type BridgeInstallResult,
 } from './bridge/installer';
 import { cleanupAllImageCaches, cleanupStaleImageCaches } from './bridge/host';
@@ -42,6 +44,9 @@ let resolveUserDisplayUrlImpl: (() => Promise<string | null>) | null = null;
 let authProxy: DshProxy | null = null;
 let authProxyStarted = false;
 
+/** 扩展上下文（模块级保存：复制日志时需要扩展版本号重打环境信息头） */
+let extensionContext: vscode.ExtensionContext | null = null;
+
 /** 日志缓冲（供「复制日志」命令 dsh.copyLogs 使用；上限行数防内存膨胀） */
 const logBuffer: string[] = [];
 /** 日志缓冲最大行数（超出后丢弃最早的行） */
@@ -56,6 +61,9 @@ function appendLog(line: string): void {
   if (logBuffer.length > LOG_BUFFER_MAX) logBuffer.shift();
   output?.appendLine(full);
 }
+/** 两个面板实例（模块级可空变量：onConfigChanged 需要刷新它们的缩放等渲染期设置） */
+let panelPrimary: DshPanelProvider | null = null;
+let panelSecondary: DshPanelProvider | null = null;
 
 /** globalState 键：用户点击「不再提示」后置 true，持久静默桥接降级警告 */
 const BRIDGE_SILENCE_KEY = 'dsh.bridgeWarningSilenced';
@@ -63,6 +71,10 @@ const BRIDGE_SILENCE_KEY = 'dsh.bridgeWarningSilenced';
 /** DshConfig → ManagerOptions（探测 3s、轮询 0.5s，与规格一致） */
 function toManagerOptions(config: DshConfig): ManagerOptions {
   return {
+    profile: config.profile,
+    // 启动来源首选与桌面端命令路径（v0.4.3：Windows 上区分 npm / DSH Desktop 两种装法）
+    launchPreference: config.launchPreference,
+    desktopCommandPath: config.desktopCommandPath,
     host: config.host,
     port: config.port,
     extraArgs: config.extraArgs,
@@ -73,6 +85,10 @@ function toManagerOptions(config: DshConfig): ManagerOptions {
     openInBrowser: config.openInBrowser,
     timeoutMs: 3000,
     pollMs: 500,
+    // 启动总超时由 dsh.startTimeoutMs 驱动（默认 45s；Windows 冷启动实测 17–23s，issue #23）
+    startTimeoutMs: config.startTimeoutMs,
+    // 子进程额外环境变量：dsh.env 与 dsh.useEnvProxy 合并（issue #18；无配置时 runner 不传 env）
+    env: buildChildEnv(config.env, config.useEnvProxy),
   };
 }
 
@@ -83,21 +99,27 @@ function toManagerOptions(config: DshConfig): ManagerOptions {
  * 进程不同，profiles 双位置仍可能解析不到桥接包；而 npm 全局 node_modules
  * （AppData\Roaming\npm\node_modules）是确定可达的位置。本函数据此返回该目录作为第三安装目标。
  *
- * 规则（仅 win32）：
- * - 优先 config.executablePath（非空且不以 .js 结尾）→ dirname；
- * - 否则 findInPath('dsh.cmd', process.env.PATH) → dirname；
- * - 都找不到 → undefined（不传，保持双位置向后兼容）。
+ * 规则（仅 win32，issue #20 修正）：
+ * - config.executablePath 以 .js 结尾（包内入口，如 DSH Desktop 的 `…\@deepseek-ai\dsh\lib\bin.js`）
+ *   → 从该路径**向上寻找第一个 node_modules 目录**；找不到就放弃该目标；
+ * - config.executablePath 指向垫片（.cmd）→ 用 `dirname(垫片)/node_modules`
+ *   （垫片目录本身不是 node_modules 根，直接返回它会把桥接包写进别人的私有目录）；
+ * - 否则 findInPath('dsh.cmd', PATH) → 同上推导；
+ * - 推导不出真正的 node_modules 根 → undefined（只装 profiles 双位置）。
  * - 非 win32 → undefined。
  */
 function resolveNpmGlobalNodeModules(config: DshConfig): string | undefined {
   if (process.platform !== 'win32') return undefined;
   const exec = config.executablePath;
-  if (exec && !exec.endsWith('.js')) {
-    return dirname(exec);
+  if (exec && exec.endsWith('.js')) {
+    return npmNodeModulesRootFrom(exec);
+  }
+  if (exec) {
+    return join(dirname(exec), 'node_modules');
   }
   const found = findInPath('dsh.cmd', process.env.PATH ?? '');
   if (found) {
-    return dirname(found);
+    return join(dirname(found), 'node_modules');
   }
   return undefined;
 }
@@ -132,9 +154,76 @@ function describeDshExecutable(config: DshConfig): { path: string | null; versio
         /* 读取失败按版本未知处理 */
       }
     }
+    // DSH Desktop 的命令是自研包装脚本（没有 npm 布局），但它的运行时包清单在 cli 目录下：
+    // 不读这一处，环境信息头永远显示「dsh 版本: 未知」，问题报告少一关键信息。
+    const desktopRoot = desktopRootFromShim(shim);
+    if (desktopRoot !== null) {
+      for (const rel of [
+        join('resources', 'runtime', 'cli', 'node_modules', '@deepseek-ai', 'dsh', 'package.json'),
+        join('resources', 'runtime', 'cli', 'package.json'),
+      ]) {
+        try {
+          const version = JSON.parse(readFileSync(join(desktopRoot, rel), 'utf8')).version;
+          if (typeof version === 'string' && version !== '') return { path: shim, version };
+        } catch {
+          /* 该候选不存在：试下一个 */
+        }
+      }
+    }
   }
   // 未定位到包（或读取失败）：保留可执行文件路径/命令名，版本标记未知
   return { path: shim ?? (process.platform === 'win32' ? null : 'dsh'), version: null };
+}
+
+/**
+ * 判断配置变更后是否必须作废旧握手（PR #35 的时序隐患修复）。
+ *
+ * 背景：这段逻辑在 `reconfigure` 之前执行，拿到的快照反映的是**旧目标**，
+ * 所以不能直接用它为「新目标是否已有服务」背书。
+ *
+ * 规则（与既有行为取并集）：
+ * - host/port 变了 → 连的是另一个服务，旧握手不能替新目标背书 → 必须重握手；
+ * - 不是「就绪的外部服务」→ 插件自启的服务会按新 profile 重启 → 必须重握手；
+ * - 其余情况（端点未变、旧目标本就是外部就绪服务）→ 复用握手结果，只重装该 profile 的桥接。
+ */
+export function shouldResetHandshake(
+  changed: { profile: boolean; endpoint: boolean },
+  snapshot: { state: string; owned: boolean } | null,
+): boolean {
+  if (changed.endpoint) return true;
+  return !(snapshot?.state === 'ready' && !snapshot.owned);
+}
+
+/**
+ * 输出环境信息头：版本/平台/可执行文件/关键配置 + **实际启动来源**。
+ *
+ * 为什么做成可重复调用的函数：激活时服务尚未启动，拿不到「实际入口」；
+ * 而 `DSH: 复制日志` 导出的头部才是问题报告的第一手依据，必须在启动之后再补一份
+ * （issue #30/#31 的排查正是靠「到底用了哪个 dsh」这一行）。
+ */
+function logEnvironmentInfo(config: DshConfig): void {
+  appendLog('=== DSH 扩展环境信息 ===');
+  appendLog(`扩展版本: ${extensionContext?.extension.packageJSON.version ?? '未知'}`);
+  appendLog(`VS Code 版本: ${vscode.version}`);
+  appendLog(`平台: ${process.platform} (${process.arch})`);
+  const electronVersion = (process.versions as { electron?: string }).electron;
+  appendLog(`宿主 Node: ${process.version}${electronVersion ? ` / Electron ${electronVersion}` : ''}`);
+  const dshInfo = describeDshExecutable(config);
+  appendLog(`dsh 可执行文件: ${dshInfo.path ?? '未定位'}`);
+  appendLog(`dsh 版本: ${dshInfo.version ?? '未知'}`);
+  // 实际启动来源与入口：由 process runner 的 lastStart 提供（未启动时明确标注）
+  const lastStart = manager?.lastStart ?? null;
+  appendLog(`dsh 启动来源: ${lastStart?.source ?? '未启动'}`);
+  appendLog(`dsh 实际入口: ${lastStart?.command ?? '未定位'}${lastStart ? ` ${JSON.stringify(lastStart.args.slice(0, 2))}` : ''}`);
+  appendLog(
+    `配置: profile=${config.profile} launchPreference=${config.launchPreference} ` +
+    `desktopCommandPath=${config.desktopCommandPath || '(空，自动探测)'} ` +
+    `host=${config.host} port=${config.port} autoStart=${config.autoStart} stopOnExit=${config.stopOnExit} ` +
+    `bridgeEnabled=${config.bridgeEnabled} extraArgs=${JSON.stringify(config.extraArgs)} ` +
+    `executablePath=${config.executablePath || '(空)'}`,
+  );
+  appendLog(`工作区: ${vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath).join(', ') || '(无)'}`);
+  appendLog('=============================');
 }
 
 /** 插件激活：VS Code 启动完成后调用 */
@@ -146,23 +235,8 @@ export function activate(context: vscode.ExtensionContext): void {
   const { config, errors } = readConfig();
   for (const err of errors) appendLog(`[config] ${err}`);
 
-  // —— 环境信息头：版本/平台/可执行文件/关键配置，问题报告排查的第一手依据 ——
-  appendLog('=== DSH 扩展环境信息 ===');
-  appendLog(`扩展版本: ${context.extension.packageJSON.version}`);
-  appendLog(`VS Code 版本: ${vscode.version}`);
-  appendLog(`平台: ${process.platform} (${process.arch})`);
-  const electronVersion = (process.versions as { electron?: string }).electron;
-  appendLog(`宿主 Node: ${process.version}${electronVersion ? ` / Electron ${electronVersion}` : ''}`);
-  const dshInfo = describeDshExecutable(config);
-  appendLog(`dsh 可执行文件: ${dshInfo.path ?? '未定位'}`);
-  appendLog(`dsh 版本: ${dshInfo.version ?? '未知'}`);
-  appendLog(
-    `配置: host=${config.host} port=${config.port} autoStart=${config.autoStart} stopOnExit=${config.stopOnExit} ` +
-    `bridgeEnabled=${config.bridgeEnabled} extraArgs=${JSON.stringify(config.extraArgs)} ` +
-    `executablePath=${config.executablePath || '(空)'}`,
-  );
-  appendLog(`工作区: ${vscode.workspace.workspaceFolders?.map((f) => f.uri.fsPath).join(', ') || '(无)'}`);
-  appendLog('=============================');
+  extensionContext = context;
+  logEnvironmentInfo(config);
 
   // —— 桥接状态（单一状态，两个面板共享，避免多个面板重复触发定时器）——
   // install：桥接安装结果；桥接禁用时为 null（不安装、不评估、不弹警告）。
@@ -176,6 +250,7 @@ export function activate(context: vscode.ExtensionContext): void {
 
   /** 桥接安装参数（dshHome / bridgeSourceDir 全插件共用，避免三处重复拼接；Windows 装配第三安装目标） */
   const installOpts = {
+    profile: config.profile,
     dshHome: process.env.DSH_HOME ?? join(homedir(), '.dsh'),
     bridgeSourceDir: join(__dirname, 'bridge-client'),
     fs: createNodeFs(),
@@ -528,6 +603,8 @@ export function activate(context: vscode.ExtensionContext): void {
     frameBaseOverride: () =>
       authProxyStarted && authSessionState === 'ok' && manager?.getSnapshot().state === 'ready' ? (authProxy?.baseUrl ?? null) : null,
     onAuthUrlSubmit: (url) => void handleAuthUrlSubmit(url),
+    // 面板缩放：由 dsh.panel.zoomLevel 驱动（issue #8）
+    zoomLevel: () => readConfig().config.panelZoomLevel,
   });
 
   /** 用户浏览器可打开的 DSH 地址：优先带 token 的启动网址（0.1.2 起浏览器需要它完成登录） */
@@ -582,7 +659,7 @@ export function activate(context: vscode.ExtensionContext): void {
   });
 
   // 左右两侧各一个 provider 实例，共享同一 manager（服务状态一致）
-  const panelPrimary = new DshPanelProvider(
+  panelPrimary = new DshPanelProvider(
     manager,
     () => {
       void showSecondaryGuideOnce(context); // 首次打开面板弹一次入口引导
@@ -596,7 +673,7 @@ export function activate(context: vscode.ExtensionContext): void {
     imageFallbackGetter, // imageFallback：dsh.image.fallback 驱动图片降级
     panelUi(), // 会话三态 / 代理地址覆盖 / 登录提交（DSH ≥0.1.2 鉴权适配）
   );
-  const panelSecondary = new DshPanelProvider(
+  panelSecondary = new DshPanelProvider(
     manager,
     onPanelFirstOpen, // 辅助侧边栏首次打开同样触发握手超时
     onBridgeAck,
@@ -640,6 +717,22 @@ export function activate(context: vscode.ExtensionContext): void {
     vscode.commands.registerCommand('dsh.bridge.uninstall', () => void uninstallBridgeCmd()),
     vscode.commands.registerCommand('dsh.cleanupImageCache', () => void cleanupImageCacheCmd()),
     vscode.workspace.onDidChangeConfiguration((e) => {
+      // 目标变化判定见 shouldResetHandshake 的注释（纯函数，单独单测）
+      const changed = {
+        profile: e.affectsConfiguration('dsh.profile'),
+        endpoint: e.affectsConfiguration('dsh.host') || e.affectsConfiguration('dsh.port'),
+      };
+      if (changed.profile || changed.endpoint) {
+        const next = readConfig().config;
+        if (installOpts.profile !== next.profile) {
+          installOpts.profile = next.profile;
+          install = next.bridgeEnabled ? safeInstallBridge() : null;
+        }
+        if (shouldResetHandshake(changed, manager?.getSnapshot() ?? null)) {
+          clearHandshakeTimer();
+          handshakeOk = undefined;
+        }
+      }
       if (e.affectsConfiguration('dsh')) onConfigChanged();
     }),
     { dispose: () => manager?.dispose() },
@@ -687,6 +780,12 @@ async function copyUrl(): Promise<void> {
 
 /** 复制完整 DSH 日志（含环境信息头）到剪贴板：问题报告的提交内容 */
 async function copyLogs(): Promise<void> {
+  // 导出前补打一份环境信息头：激活时服务还没启动，只有此刻才有「实际启动来源/入口」
+  try {
+    logEnvironmentInfo(readConfig().config);
+  } catch {
+    /* 读取设置失败不影响导出既有日志 */
+  }
   await vscode.env.clipboard.writeText(logBuffer.join('\n'));
   void vscode.window.showInformationMessage(t('msg.logsCopied'));
 }
@@ -735,13 +834,16 @@ async function cleanupImageCacheCmd(): Promise<void> {
   void vscode.window.showInformationMessage(t('msg.imageCacheCleaned', { count: removed }));
 }
 
-/** 配置变更：host/port 变化时自动重启自启服务，退出策略实时生效 */
+/** 配置变更：profile/host/port 变化时自动重启自启服务，退出策略实时生效 */
 function onConfigChanged(): void {
   const m = manager;
   if (!m) return;
   const { config } = readConfig();
   void m.reconfigure(toManagerOptions(config));
   m.setExitBehavior(!config.stopOnExit);
+  // 面板缩放（dsh.panel.zoomLevel）等"渲染期读取"的设置项：就地重渲染即可生效，无需重载窗口
+  panelPrimary?.refreshContextBar();
+  panelSecondary?.refreshContextBar();
 }
 
 /** 插件停用：按 stopOnExit 决定是否停止自启服务（只杀插件自启的） */

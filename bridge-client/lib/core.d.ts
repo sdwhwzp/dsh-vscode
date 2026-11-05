@@ -7,8 +7,31 @@ export function isAllowedExternalUrl(url: string): boolean;
 /** 构造"打开外链"消息 */
 export function buildOpenExternalMessage(url: string): { kind: 'openExternal'; url: string };
 
-/** 构造"打开文件"消息（cwd 为会话工作目录，可选） */
-export function buildOpenFileMessage(path: string, cwd: string | undefined): { kind: 'openFile'; path: string; cwd?: string };
+/** 构造"打开文件"消息（cwd 为会话工作目录，可选；无 cwd 时可携带 missReason 诊断） */
+export function buildOpenFileMessage(
+  path: string,
+  cwd: string | undefined,
+  missReason?: string,
+): { kind: 'openFile'; path: string; cwd?: string; missReason?: string };
+
+/** 诊断未取到会话 cwd 的原因（no-ctx / no-sessions-api / no-session-id / session-not-in-list / session-has-no-cwd / probe-failed） */
+export function cwdMissReason(ctx: unknown, sessionId: unknown): string;
+
+/**
+ * 从 DSH 客户端根上下文取当前会话的工作目录（issue #32）；
+ * 任何一层缺失或值非法都返回 undefined（调用方退回不带 cwd 的旧行为）。
+ */
+export function resolveSessionCwd(ctx: unknown, sessionId: unknown): string | undefined;
+
+/**
+ * DSH 页面里「文件入口」按钮的稳定选择器（issue #22）：
+ * 覆盖 markdown 文件名（CSS Module 哈希类名）/ produced 芯片 / present 卡片，
+ * 并排除 aria-haspopup 的宿主菜单按钮。
+ */
+export const FILE_ENTRY_SELECTOR: string;
+
+/** 从被点击的文件入口按钮解析要转发的路径（title 优先；aria-label 仅作兜底）；无法判断返回 null */
+export function resolveFileEntryPath(btn: unknown): string | null;
 
 /** 构造"工作区同步回执"消息（bridgeAck，path 可选；version 为桥接包版本） */
 export function buildSyncWorkspaceAck(ok: boolean, path?: string, version?: string): { kind: 'bridgeAck'; ok: boolean; path?: string; version?: string };

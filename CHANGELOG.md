@@ -1,3 +1,160 @@
+## [Unreleased]
+
+### 测试
+
+测试用例共 320 个；2 个真实 DSH 集成测试按环境门控执行、1 个 Windows 专属用例仅在 Windows 平台执行。
+当前测试数量由 README 与本节共同校验，已发布版本的历史测试数字保持不变。
+
+## [0.4.3] - 2026-10-16
+
+### 新增
+
+- **启动来源可选** `dsh.launchPreference`（`auto` / `npm` / `desktop`，默认 `auto`）与 `dsh.desktopCommandPath`：
+  首选的那种 `dsh` 安装不存在时自动改用另一种，并在日志与「复制日志」的环境信息头里写明实际来源与实际入口。
+- **DSH Desktop 启动支持**（issue #30、#31）：Windows 上 npm 全局安装与 Desktop 安装都能启动。
+  npm 装法仍以 `node <bin.js>` 直跑；Desktop 的 `dsh.cmd`（同目录没有 `node_modules` 布局）改为
+  `cmd.exe /d /s /c` 直接执行脚本本身，不再推导出不存在的 bin.js；`dsh.executablePath` 指向
+  `.cmd`/包装脚本时同样直接执行该脚本。
+
+### 修复
+
+- **相对路径点击提示不可诊断（真机反馈，`0.4.3-test4` 实测）**：点纯文件名（如 `a.png`）只提示
+  「无法解析路径：a.png」，看不出缺的是会话 cwd 还是工作区根。现在桥接会带上诊断原因
+  （`no-ctx` / `no-sessions-api` / `no-session-id` / `session-not-in-list` / `session-has-no-cwd`），
+  提示写明缺哪个基准并给绝对路径的出路。
+- **日志噪音与版本号（真机反馈，`0.4.3-test3` 实测）**：PATH 里只有 DSH Desktop 的命令时，
+  npm 分支不再去推导 npm 布局的 bin.js（原先每次启动都刷「bin.js missing」并多算一个候选）；
+  环境信息头新增从 Desktop 运行时包清单读出的 `dsh 版本`（原先恒为「未知」）。
+- **DSH Desktop 启动失败（真机反馈，`0.4.3-test2` 实测）**：含空格路径下 cmd 收到的是被 Node
+  二次转义的字面引号，报「文件名、目录名或卷标语法不正确」。改为：桌面端目录若存在 `bin.js`，
+  直接 `node bin.js`（与 npm 装法同构，完全不需要 cmd 引号）；否则才用 cmd，并以
+  `windowsVerbatimArguments` 原样传命令行。
+- **DSH Desktop 启动失败（真机反馈，`0.4.3-test1` 实测）**：`cmd.exe /d /s /c` 执行含空格的脚本路径时
+  必须写成 `""…dsh.cmd""`（`/s` 会剥掉最外层引号），否则 cmd 在空格处截断并报
+  「'C:\Users\…\Programs\DeepSeek' 不是内部或外部命令」，服务反复换端口重试后失败。
+- **面板里点图片/PDF 打不开**（issue #33）：交付物改用 `vscode.open` 打开，由 VS Code 自选编辑器
+  （图片预览 / 内建 PDF / 二进制占位页），不再用只能开文本编辑器的 `showTextDocument`。
+- **相对路径按错误基准解析**（issue #32）：桥接转发文件时携带**会话 cwd**（取法同 DSH 官方前端）；
+  取不到 cwd 时不阻塞点击，退回工作区根并在日志说明。
+- **切换 host/port 后桥接误报健康**（PR #35 隐患）：端点变化一律作废旧握手；仅换 profile 时，
+  只有「就绪的外部服务」继续复用握手，自启服务按新 profile 重启后等新页面握手。
+- **卸载钩子的写入面**（PR #35 隐患）：遍历 `profiles/` 时要求条目同时满足「名字合法、非符号链接、
+  realpath 仍在 profiles 内」，避免符号链接把 `$DSH_HOME` 之外的 `cordis.patch.yml` 改写掉。
+
+### 桥接与 profile（合并 PR #35，贡献者 @jubeater）
+
+- **可配置 DSH profile**：新增 `dsh.profile`，默认 `web`，启动参数和桥接安装目录使用所选 profile。
+- **多 profile 桥接清理**：其它 profile 仍注册桥接时保留共享副本，最后一个使用者卸载后再清理。
+- **profile 切换握手**：仅保留就绪外部服务的握手结果，自启服务或服务未运行时等待新握手。
+
+### 测试
+
+测试用例共 318 个；本次验证 315 个通过，2 个真实 DSH 集成测试按环境门控跳过、1 个 Windows 专属用例
+在非 Windows 平台跳过。当前测试数量由 README 与本节共同校验，已发布版本的历史测试数字保持不变。
+
+## [0.4.2] - 2026-09-28
+
+> 版本号说明：原计划的 `0.4.1.1` 是四段式版本号，VS Code 扩展清单不接受
+> （实测 `vsce package` 报 `Invalid extension "version"`，只允许 `major.minor.patch`），
+> 因此本次改动以 **0.4.2** 为单位发布；开发期试产包为 `0.4.2-testN`，桥接包与插件始终同版本号。
+
+### 撤回
+
+以下能力由 PR #11 引入、随 0.4.1 发布，经实测**不完善**，本版整体撤回，待原作者基于最新
+`main` 重新提交后再评估：
+
+- **编辑器上下文联动**：面板工具条（当前文件 / 加入 / 自动跟随）与 `dsh.context.*` 两个设置项。
+  撤回原因是交互设计不成立——注入内容固定为「当前文件路径」，且**直接作为消息发进会话**，
+  用户既无法选择要发送什么，也没有发送前确认/编辑的机会；
+- **右键菜单命令**：`dsh.addFileContext`、`dsh.askAboutFile`、`dsh.addPathContext`
+  及其在编辑器/资源管理器/标签栏的菜单项（`dsh.sendSelection`、`dsh.openContextPanel` 回到 0.4.0 行为）；
+- **工作区自适应**：切换工作区时自动以新项目为 cwd 重启服务并注册工作区。
+
+因此 **issue #27（切一次活动编辑器就整页重载面板）随撤回消失**：该重载由「活动编辑器变化 →
+上下文工具条刷新 → 重渲染 webview（每次重建 nonce 即整页重载）」这条链路触发，链路本身已整体移除。
+（报告者 [@AAAwoshi](https://github.com/AAAwoshi) 给出了完整定位、日志采样证据与最小补丁，
+并做了补丁前后的对照复测；[@HafenYin](https://github.com/HafenYin) 一并确认了该现象的复现频率。）
+面板缩放的即时生效不受影响——配置变更仍走 `refreshContextBar()` 重渲染，只是不再由文件切换触发。
+
+### 升级提示
+
+- 若你曾在设置里配过 `dsh.context.autoFollow` 或 `dsh.context.followDebounceMs`，升级后这两项
+  会显示为**未知配置**（功能无影响），在 `settings.json` 或设置界面里删掉即可；
+- 本次未改动桥接协议与图片转发链路，发图、外链跳转、面板点击文件转发均不受影响。
+
+### 测试
+
+测试用例由 326 降至 284（移除随 PR #11 引入的 52 个用例，新增 #27 回归防线、本地化一致性守卫、文档数字一致性守卫），
+`npm run typecheck` 无错误，`npm test` 284/284 全绿。
+
+## [0.4.1] - 2026-09-21
+
+> 版本号说明：原先并入 main 的 `0.5.0` 编号已**回退并入本版 0.4.1**（该版本从未发布到商店，
+> 回退不产生用户可见的版本断档）。0.4.0 之后的所有改动都以 0.4.1 为单位发布。
+
+### 新增
+
+- **面板网页缩放** `dsh.panel.zoomLevel`（issue #8）：可把内嵌的 DSH 页面整体放大/缩小
+  （下拉档位 50%–150%，每 5% 一档共 21 档；更细的值可在 `settings.json` 直接写 0.5–1.5 的任意数值。默认 100%）。
+  实现为「iframe 逻辑尺寸 = `calc(100% / zoom)`、再 `transform: scale(zoom)` 且原点在左上」，
+  物理尺寸恒等于面板可用区域，因此缩小与放大两个方向都完美铺满、无滚动条，点击命中也准确
+  （真机几何实测：0.5/0.75/1/1.25/1.5 × 有/无工具条，留白 0、容器内三处取点命中均为 iframe）。
+- **子进程环境变量注入** `dsh.env` 与 `dsh.useEnvProxy`（issue #18）：向 DSH 子进程注入额外
+  环境变量（与父进程环境合并，原有变量全部保留）。`dsh.useEnvProxy` 开启时会确保
+  `NODE_OPTIONS` 含 `--use-env-proxy`（不覆盖用户已有的其它 NODE_OPTIONS 选项），
+  解决**必须走代理的网络里 DSH 无法请求模型 API** 的问题——Node 的原生 fetch 默认不读
+  `HTTP(S)_PROXY`，实测：把 `https_proxy` 指向死地址仍直连成功，加上该启动参数才会真的走代理；
+  而该参数是 Node 启动参数，原先的 `dsh.extraArgs` 只能拼在 `dsh web` 之后，无法生效。
+- **启动总超时可配** `dsh.startTimeoutMs`（issue #23）：默认由 15 秒放宽到 **45 秒**
+  （Windows 冷启动实测 17–23 秒），可配区间 5000–600000 毫秒。
+
+### 修复
+
+- **面板里点击文件不转发到 VS Code 编辑器**（issue #22）：DSH 把文件名内联渲染成 CSS Module
+  **哈希类名**（实测 `fileMention_kcgor_304`），而桥接用 `classList.contains('fileMention')`
+  判断，恒为 false，导致转发整体失效；且取值顺序把 `aria-label`（本地化动作文案，如
+  「打开 <路径>」）当成路径。现改用稳定选择器（`button[class*="fileMention"]` /
+  `[data-produced-files-row] button[title]` / `[data-presented-file] button[title]`，
+  并排除 `aria-haspopup` 的宿主原生菜单按钮），解析时 **`title` 优先**，
+  `aria-label` 仅在能抽出引号包裹的路径时兜底，覆盖聊天正文文件名 / 「本轮文件改动」芯片 /
+  present 交付卡片三类入口。
+- **桥接包被写进 DSH Desktop 私有命令目录，导致桌面下次启动失败**（issue #20）：
+  `resolveNpmGlobalNodeModules()` 把「`dsh.cmd` 所在目录」当成了 npm 全局 `node_modules` 根，
+  于是桥接包被复制进 `%APPDATA%\DSH Desktop\host-commands\desktop\bin`——该目录被 DSH Desktop
+  以硬断言独占（只允许它自己的 `dsh.cmd`），多一个条目就让桌面启动报
+  `command runtime directory contains unexpected entries`。现改为：从包内入口向上寻找真正的
+  `node_modules` 目录（找不到就放弃该目标），垫片目录返回 `<垫片目录>/node_modules`；
+  并在写入前增加白名单校验——目标目录若已存在且含**非本扩展产物**，一律跳过（目录不可读时
+  同样保守跳过），绝不往别人的私有目录里写。
+- **`cordis.patch.yml` 桥接条目重复导致插件树崩溃**（issue #19）：文件里出现两段
+  `# dsh-vscode-bridge: begin/end` 时（旧版本残留 / 多窗口并发激活），DSH 侧同一 id 多条
+  `insert` 会让插件树崩溃，用户必须手工删除重复项才能进入。安装器现在会自愈去重：
+  保留首段、删除后续段落，并保留用户自己的其它条目与头部注释。
+
+## [0.5.0] - 2026-09-10
+
+> **已于 0.4.2 撤回**：本节列出的上下文联动、右键菜单命令与工作区自适应均已在 0.4.2 中移除
+> （见上方 0.4.2「撤回」章节）。此处保留原始记录以便追溯。
+
+### 新增
+
+- **编辑器上下文联动（原 PR #11 落地）**：面板顶部上下文工具条显示当前文件，提供「加入上下文」按钮与「自动跟随」开关（设置 `dsh.context.autoFollow` / `dsh.context.followDebounceMs`，自动跟随时防抖 800ms 并注入到当前项目下最近活动的会话，无则新建）；编辑器右键 / 资源管理器右键 / 编辑器标题栏右键菜单（加入上下文 / 用 DSH 询问 / 发送选区）；切换 VS Code 工作区时自动以新项目为工作目录重启 DSH 服务，并幂等注册 DSH 工作区。
+- 新增命令：`dsh.addFileContext`、`dsh.askAboutFile`、`dsh.sendSelection`、`dsh.addPathContext`、`dsh.askAboutPath`、`dsh.openContextPanel`。
+
+### 变更
+
+- **上下文注入适配 DSH ≥0.1.2（本版重点）**：API 客户端支持两代线格式——0.1.2 的斜杠端点（`POST /api/session/prompt`）与 `payload.args.<参数名>` 包装（list 用 `_request`、其余用 `request`），遇 404 自动回退 ≤0.1.1 的点分端点并在实例内缓存判定；补齐 `session/prompt` 契约必填的 `requestId`（缺失会被网关以 `gateway/input-invalid` 拒绝，实测确认）。
+- **经本地代办注入（鉴权）**：上下文注入请求改走扩展的本地代办代理（`127.0.0.1` 随机端口），由代办注入会话 cookie 并适配 `/api` browser-trust fence——与面板同一条鉴权链路，无需单独维护 cookie；面板尚未完成登录时最多等待 5 秒再提示，避免刚打开面板即报错。
+- 合并 PR #11 分支（解决与 0.4.0 的 17 个文件冲突：鉴权接线/工具条渲染/配置项/文档/测试双侧保留）。
+- 版本升至 **0.5.0**（扩展与桥接版本同步，防漂移测试强制）。
+
+### 安全说明（上下文联动）
+
+- 默认只注入**文件路径引用**（`上下文:当前文件 \`<相对路径>\`(仅供参考,无需回复)`），**不发送文件内容**；
+- 仅「DSH: 发送选中内容」会把选中的代码发送到会话，且必须由用户主动触发；
+- 自动跟随默认**关闭**（`dsh.context.autoFollow=false`），开启后也只发送路径；
+- 注入等价于以用户身份在会话里发消息，权限边界与用户在面板输入相同。
+
 ## [0.4.0] - 2026-09-10
 
 ### 修复

@@ -130,7 +130,7 @@ dsh web: http://127.0.0.1:3080/?token=<一次性 token>
 
 为让 DSH 网页能与 VS Code 通信，插件会：
 
-1. 在你的 DSH 用户目录（`$DSH_HOME/profiles/web`，默认 `~/.dsh/profiles/web`）安装本扩展的桥接包 `dsh-vscode-bridge`（经 DSH 官方客户端插件扩展点安装）；
+1. 在你的 DSH 用户目录（`$DSH_HOME/profiles/<dsh.profile>`，默认 `~/.dsh/profiles/web`）安装本扩展的桥接包 `dsh-vscode-bridge`（经 DSH 官方客户端插件扩展点安装）；
 2. 在 `cordis.patch.yml` 中写入一段带 `# dsh-vscode-bridge: begin` / `# dsh-vscode-bridge: end` 标记的 `insert:` 条目，把桥接包注册为 DSH 的官方 client 插件（只写用户目录，绝不触碰 DSH 安装目录）。
 
 如需移除，两种方式任选：
@@ -171,6 +171,9 @@ dsh web: http://127.0.0.1:3080/?token=<一次性 token>
 
 | 设置项 | 默认值 | 说明 |
 |---|---|---|
+| `dsh.profile` | `web` | 启动 DSH 及安装桥接所用的 profile（自定义 profile 需提供网页界面） |
+| `dsh.launchPreference` | `auto` | 优先使用哪种 `dsh` 安装：`auto`（npm 优先，没有再桌面端）/ `npm` / `desktop`；首选不存在时自动用另一种，日志与环境信息头写明实际来源 |
+| `dsh.desktopCommandPath` | （空） | 桌面端命令绝对路径（通常 `%LOCALAPPDATA%\Programs\DeepSeek Harness\resources\runtime\cli\bin\dsh.cmd`）；留空按默认位置自动探测 |
 | `dsh.port` | `3080` | 期望端口（探测与启动共用） |
 | `dsh.host` | `127.0.0.1` | 服务地址（仅允许回环地址） |
 | `dsh.autoStart` | `true` | 服务未运行时自动启动 |
@@ -180,10 +183,49 @@ dsh web: http://127.0.0.1:3080/?token=<一次性 token>
 | `dsh.openInBrowser` | `false` | 服务启动后在默认浏览器中打开 DSH 页面（关闭时向 `dsh web` 传递 `--no-open`） |
 | `dsh.remote.enabled` | `false` | 启用远程场景（SSH Remote / WSL / Dev Containers / Codespaces）：在远端运行 dsh，经 VS Code 隧道在面板中打开（默认关闭；开启后需重载窗口生效） |
 | `dsh.image.fallback` | `true` | 当前模型无视觉能力时，把上传图片以文件路径形式随消息发送而不报错（文件缓存在会话工作目录，面板关闭时清理） |
+| `dsh.startTimeoutMs` | `45000` | 等待 `dsh web` 就绪的总超时（毫秒，5000–600000）。冷启动慢的机器（Windows 实测 17–23 秒）可调大；日志提示「未在 N 秒内就绪」但服务其实已起来时优先调此项 |
+| `dsh.env` | `{}` | 注入 DSH 子进程的额外环境变量（键值对，与父进程环境合并）。典型用法：代理网络下设 `{"NODE_OPTIONS":"--use-env-proxy"}` |
+| `dsh.useEnvProxy` | `false` | 自动为子进程的 `NODE_OPTIONS` 追加 `--use-env-proxy`（不覆盖已有选项）。必须经 HTTP/HTTPS 代理才能访问模型 API 时开启 |
+| `dsh.panel.zoomLevel` | `1` | 面板内网页缩放：下拉可选 `0.5`–`1.5`（每 0.05 一档）；更细的值可直接写 `settings.json` |
+
+设置 `"dsh.profile": "custom-profile"` 和 `"dsh.port": 3081` 后，启动命令为
+`dsh --profile custom-profile --host 127.0.0.1 --port 3081 --no-open`，桥接安装到
+`$DSH_HOME/profiles/custom-profile`。修改 profile 会重启扩展自己启动的服务；
+外部服务仍按端口复用。默认 `web` 保持现有行为。
+profile 名称可包含 ASCII 字母、数字、点、下划线与连字符，不能以连字符开头，
+也不能是 `.` 或 `..`；首尾空白会自动去除。
+
+### 设置界面中英对照
+
+设置界面的**条目名**由配置键推导（点号变空格、中间段加冒号），**说明文案**来自扩展的本地化文件（包内已提供 `package.nls.zh-cn.json` / `package.nls.zh-hans.json`）。
+但在 VS Code + WSL Remote 场景下实测：即使扩展宿主的 locale 已是 `zh-cn`、nls 文件与键覆盖均正确，设置界面仍显示英文（对照中可见官方 `Remote.*` 扩展为中文）——属该环境的清单本地化限制，非扩展缺陷。因此本表作为长期可用的对照；搜索时**直接输配置键**（如 `panel.zoomLevel`、`useEnvProxy`）比输标题更容易命中。
+
+| 设置界面显示的英文名 | 配置键 | 含义 |
+|---|---|---|
+| Dsh: Auto Start | `dsh.autoStart` | 服务未运行时自动启动 `dsh web` |
+| Dsh: Bridge: Enabled | `dsh.bridge.enabled` | 启用面板与 DSH 之间的桥接（外链、文件跳转） |
+| Dsh: Bridge: Silence Warning | `dsh.bridge.silenceWarning` | 抑制桥接警告 |
+| Dsh: Env | `dsh.env` | 注入 DSH 子进程的环境变量（键值对） |
+| Dsh: Executable Path | `dsh.executablePath` | `dsh` 可执行文件绝对路径（留空则从 PATH 查找） |
+| Dsh: Extra Args | `dsh.extraArgs` | 启动 `dsh web` 时附加的参数 |
+| Dsh: Host | `dsh.host` | 服务地址（仅允许回环地址） |
+| Dsh: Image: Fallback | `dsh.image.fallback` | 模型无视觉能力时把图片降级为路径转发 |
+| Dsh: Open In Browser | `dsh.openInBrowser` | 启动后在默认浏览器打开 DSH 页面 |
+| **Dsh: Panel: Zoom Level** | `dsh.panel.zoomLevel` | **面板内网页缩放**：0.5–1.5，可自定义数值 |
+| Dsh: Profile | `dsh.profile` | 启动 DSH 及安装桥接所用的 profile，默认 `web` |
+| Dsh: Port | `dsh.port` | 期望端口（探测与启动共用） |
+| Dsh: Remote: Enabled | `dsh.remote.enabled` | 启用远程场景（SSH Remote / WSL / Dev Containers） |
+| Dsh: Start Timeout Ms | `dsh.startTimeoutMs` | 等待 `dsh web` 就绪的总超时（毫秒，默认 45000） |
+| Dsh: Stop On Exit | `dsh.stopOnExit` | 关闭最后一个窗口时停止插件启动的服务 |
+| **Dsh: Use Env Proxy** | `dsh.useEnvProxy` | **自动为子进程追加 `NODE_OPTIONS=--use-env-proxy`**（代理环境用） |
+| Dsh: Workspace Root Index | `dsh.workspaceRootIndex` | 多根工作区取第几个根目录（从 0 起） |
 
 ## 🌍 多语言
 
 界面文案跟随 VS Code 显示语言（`Configure Display Language`）：`zh-*` → 简体中文，其余语言 → 英文。
+
+扩展包内提供 `package.nls.json` / `package.nls.zh-cn.json` / `package.nls.zh-hans.json`。
+但在 **VS Code + WSL Remote** 场景实测：即使扩展宿主的 locale 已是 `zh-cn`、本地化文件与键覆盖均正确，设置界面仍显示英文（同一界面里官方 `Remote.*` 扩展为中文）——属该环境的清单本地化限制，非扩展缺陷。因此上文《设置界面中英对照》表作为长期可用的对照方案。
 
 ## 🧑‍💻 开发
 
@@ -191,7 +233,7 @@ dsh web: http://127.0.0.1:3080/?token=<一次性 token>
 
 ```bash
 npm install
-npm run test          # 161 个单元/集成测试（含真实 dsh web 全流程）
+npm run test          # 320 个单元/集成测试（含真实 dsh web 全流程：服务生命周期、鉴权会话）
 npm run compile       # 构建 out/extension.js
 npm run watch         # 监听构建
 npm run typecheck     # 类型检查
@@ -235,6 +277,36 @@ src/
 - DSH 官方仓库：<https://github.com/deepseek-ai/deepseek-harness>
 - 问题反馈：<https://github.com/Fengze233/dsh-vscode/issues>
 - DSH 社区讨论：<https://github.com/deepseek-ai/deepseek-harness/discussions>
+
+## 🙏 贡献者与致谢
+
+本扩展的许多改进来自社区。以下贡献按类型列出（对应提交/讨论可在仓库对应编号查看）：
+
+### 代码贡献
+
+| 贡献者 | 贡献内容 | 关联 |
+|---|---|---|
+| （暂无） | 当前版本没有已合并的社区代码贡献 | — |
+
+### 问题报告
+
+| 报告者 | 报告内容 | 关联 |
+|---|---|---|
+| [@AAAwoshi](https://github.com/AAAwoshi) | 切换活动编辑器导致面板整页重载：定位到 `refreshContextBar()` 里多余的 `render()` 与每次渲染重生成 nonce，并附日志采样证据、最小补丁与补丁后复测数据 | #27 |
+| [@Joshuayang228](https://github.com/Joshuayang228) | 点文件不转发到编辑器：定位到 CSS Module 哈希类名根因，并附完整实测证据与修法 | #22 |
+| [@lizhuoyuan41-droid](https://github.com/lizhuoyuan41-droid) | 桥接包被写进 DSH Desktop 私有命令目录导致桌面启动失败：给出根因与白名单建议 | #20 |
+| [@Minelenbolan](https://github.com/Minelenbolan) | `cordis.patch.yml` 桥接条目重复导致插件树崩溃 | #19 |
+| [@HafenYin](https://github.com/HafenYin) | Windows 冷启动超过 15 秒被误报超时（附完整启动日志） | #23 |
+| [@NOIPJohnny](https://github.com/NOIPJohnny) | 代理环境下 DSH 无法请求模型，建议注入子进程环境变量 | #18 |
+| [@ThinBuffalo](https://github.com/ThinBuffalo) | 面板内网页缩放需求 | #8 |
+| [@smallshieh](https://github.com/smallshieh) | 编辑器上下文注入需求（当前文件/选区随消息发送） | #10 |
+| [@Tsechiyuan](https://github.com/Tsechiyuan) | 选中代码直接发送到会话的需求 | #7 |
+| [@sseryling](https://github.com/sseryling) | WSL Remote 下面板白屏与桥接握手失败：附实测修复方案 | #13 |
+| [@Zanford](https://github.com/Zanford) | VS Code 中 DSH 无法正常拉起 | #12 |
+
+### 上游
+
+- 窄视口下输入框中文光标问题（#9）经核查位于 DSH 官方前端 composer（旧版「可见字形 backdrop + 透明 textarea」双层度量），上游已重构为 Lexical 编辑器，故按上游结论关闭。
 
 ## 📄 License
 

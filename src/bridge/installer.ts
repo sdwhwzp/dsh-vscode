@@ -1,7 +1,7 @@
 // src/bridge/installer.ts — DSH 桥接包的探测与幂等安装/卸载
-// 职责：把 bridge-client 包安装进用户 profile 目录（$DSH_HOME/profiles/web），
+// 职责：把 bridge-client 包安装进用户 profile 目录（$DSH_HOME/profiles/<profile>），
 // 并通过 cordis.patch.yml 的 insert: 条目把它注册为 DSH 的官方 client 插件。
-// 安全边界：只写用户目录（$DSH_HOME/profiles/web），绝不触碰 DSH 安装目录。
+// 安全边界：只写用户目录（$DSH_HOME/profiles/<profile>），绝不触碰 DSH 安装目录。
 //
 // 关键约束（来自 Task 0 spike 实测，见 task-0-report.md）：
 // 1. cordis.patch.yml 顶层是流式空数组 `[]` 时，不能在其后直接追加块序列条目，
@@ -9,7 +9,7 @@
 // 2. 新增条目必须用 `insert:` 包裹；裸 `- id:` 条目是「按 id 覆盖既有行」的 patch，
 //    目标行不存在时只会告警并跳过，不会真正新增条目。
 // 3. 卸载时按 begin/end 标记精确删除条目段；若删除后仅剩空白，还原为 `[]`。
-import { join, dirname } from 'node:path';
+import { join, dirname, win32 } from 'node:path';
 import * as nodeFs from 'node:fs';
 
 /** 桥接条目在 cordis.patch.yml 中的包裹标记（卸载时按标记精确删除） */
@@ -32,6 +32,9 @@ export interface InstallerFs {
   copyDir(src: string, dest: string): void;
   rmDir(p: string): void;
   readdir(p: string): string[];
+  /** 是否为符号链接（卸载钩子用：跟随链接会写到 $DSH_HOME 之外，必须显式跳过）。
+   *  可选：既有内存 fs 实现与旧调用方无需改动。 */
+  isSymlink?(p: string): boolean;
 }
 
 /** 安装结果状态：ok 成功；pending-restart 预留（服务重启后生效）；degraded 降级 */
@@ -42,11 +45,12 @@ export interface BridgeInstallResult {
   status: BridgeInstallStatus;
   reason?: string;   // degraded 时的原因（英文短句，日志用）
   profileDir?: string;
-  bridgeDir?: string; // 安装目标目录（保持兼容：语义为 primary 路径 profiles/web/node_modules/dsh-vscode-bridge；secondary 见 bridgeTargetDirs）
+  bridgeDir?: string; // primary 路径 profiles/<profile>/node_modules/dsh-vscode-bridge；secondary 见 bridgeTargetDirs
 }
 
 /** 安装参数 */
 export interface BridgeInstallOptions {
+  profile?: string;          // DSH profile 名称，默认 web
   dshHome: string;            // $DSH_HOME 或 ~/.dsh
   bridgeSourceDir: string;    // 插件随附 bridge-client 目录绝对路径
   fs: InstallerFs;            // 注入的 fs 子集
@@ -55,11 +59,11 @@ export interface BridgeInstallOptions {
 }
 
 /**
- * 定位 web profile 目录：dshHome/profiles/web。
+ * 定位所选 profile 目录：dshHome/profiles/<profile>。
  * 不存在时返回 null（调用方据此判定为 degraded）。
  */
-export function detectProfileDir(dshHome: string, fs: InstallerFs): string | null {
-  const dir = join(dshHome, 'profiles', 'web');
+export function detectProfileDir(dshHome: string, fs: InstallerFs, profile = 'web'): string | null {
+  const dir = join(dshHome, 'profiles', profile);
   return fs.exists(dir) ? dir : null;
 }
 
@@ -76,7 +80,7 @@ function isProfileBundle(profileDir: string, fs: InstallerFs): boolean {
  * 桥接包的全部安装目标目录。
  *
  * 背景（Windows 实测，见 bridge-locations-fix-report.md）：
- * - primary：profiles/web/node_modules/dsh-vscode-bridge（WSL 模块解析锚点）；
+ * - primary：profiles/<profile>/node_modules/dsh-vscode-bridge（WSL 模块解析锚点）；
  * - secondary：profiles/node_modules/dsh-vscode-bridge（Windows profile 插件解析 fallback 真实目录）；
  * - npm 全局位置（可选）：Windows 下 VS Code 扩展宿主 spawn 的 dsh 进程对 profile 插件的 ESM
  *   解析与普通命令行进程不同，profiles 双位置仍可能解析不到桥接包；而 npm 全局 node_modules
@@ -85,7 +89,7 @@ function isProfileBundle(profileDir: string, fs: InstallerFs): boolean {
  *
  * 顺序固定：[primary, secondary, ...(npmGlobalNodeModules ? [join(npmGlobalNodeModules, NAME)] : [])]
  *
- * @param profileDir            web profile 目录绝对路径
+ * @param profileDir            所选 profile 目录绝对路径
  * @param npmGlobalNodeModules  npm 全局 node_modules 目录绝对路径（可选，缺省仅双位置）
  */
 export function bridgeTargetDirs(profileDir: string, npmGlobalNodeModules?: string): string[] {
@@ -97,6 +101,57 @@ export function bridgeTargetDirs(profileDir: string, npmGlobalNodeModules?: stri
     dirs.push(join(npmGlobalNodeModules, BRIDGE_PACKAGE_NAME));
   }
   return dirs;
+}
+
+/**
+ * 从「dsh 包内文件路径」向上寻找第一个 `node_modules` 目录（issue #20）。
+ *
+ * 场景：`dsh.executablePath` 指向 `…\app.asar.unpacked\node_modules\@deepseek-ai\dsh\lib\bin.js`
+ * 这类包内入口时，`dirname` 得到的是包内目录而非 node_modules 根；逐级上溯才能拿到真正的根。
+ * 全程用 path.win32，避免在非 Windows 上单测这条 Windows 逻辑时被平台路径规则干扰。
+ *
+ * @returns node_modules 根目录；路径中不含 node_modules 段时返回 undefined（调用方放弃该目标）
+ */
+export function npmNodeModulesRootFrom(p: string): string | undefined {
+  let dir = win32.dirname(p);
+  for (let i = 0; i < 12; i += 1) {
+    if (win32.basename(dir).toLowerCase() === 'node_modules') return dir;
+    const parent = win32.dirname(dir);
+    if (parent === dir) break; // 到盘符根仍未找到
+    dir = parent;
+  }
+  return undefined;
+}
+
+/**
+ * 判断该安装目标是否应当跳过：其**父目录是"命令垫片目录"**（issue #20）。
+ *
+ * 关键点（真实文件系统 + 真机验证得出，且踩过一次回归）：
+ * 危险不是"父目录里有别人的东西"，而是"**往一个被别的程序独占的命令目录里新增条目**"。
+ * 受害目录 `%APPDATA%\DSH Desktop\host-commands\desktop\bin` 被 DSH Desktop 以硬断言独占
+ * （只允许它自己的 `dsh.cmd`）：多出任何条目（含我们新建的 `dsh-vscode-bridge/`）都会让
+ * 桌面下次启动硬失败。
+ *
+ * 判据刻意收窄为「父目录里存在批处理垫片（`*.cmd`）」——这正是"命令目录"的特征：
+ * - `…/desktop/bin` 里有 `dsh.cmd` → 跳过 ✅（issue #20 的场景）
+ * - `…/node_modules`（npm 全局或 DSH profiles 下的依赖目录）里有成百上千个包，
+ *   但不会有 `dsh.cmd` → **放行**，否则桥接无法被刷新（曾因"父目录有他人条目就跳过"
+ *   导致 `profiles/node_modules` 的桥接停留在旧版本）。
+ *
+ * @param parentDir 目标目录的父目录（如 `…/node_modules` 或 `…/desktop/bin`）
+ */
+export function shouldSkipForeignTarget(
+  parentDir: string,
+  fs: Pick<InstallerFs, 'exists' | 'readdir'>,
+): boolean {
+  if (!fs.exists(parentDir)) return false; // 父目录不存在：由本扩展创建，安全
+  try {
+    // 只认"命令垫片目录"：含 *.cmd 即视为被别的程序独占的命令目录
+    return fs.readdir(parentDir).some((name) => name.toLowerCase().endsWith('.cmd'));
+  } catch {
+    // 读不到目录内容（权限/IO）时保守跳过：宁可少装一处，也不冒写坏他人目录的风险
+    return true;
+  }
 }
 
 /**
@@ -150,14 +205,18 @@ function findEmptyArrayHead(content: string): string {
  * - 已有用户内容 → 去尾随空白后追加 insert: 条目。
  */
 export function installBridge(opts: BridgeInstallOptions): BridgeInstallResult {
-  const profileDir = detectProfileDir(opts.dshHome, opts.fs);
+  const profileDir = detectProfileDir(opts.dshHome, opts.fs, opts.profile);
   if (profileDir === null) {
-    return { status: 'degraded', reason: 'web profile not found' };
+    return { status: 'degraded', reason: `${opts.profile ?? 'web'} profile not found` };
   }
   const patchPath = join(profileDir, 'cordis.patch.yml');
-  const targets = bridgeTargetDirs(profileDir, opts.npmGlobalNodeModules);
+  const allTargets = bridgeTargetDirs(profileDir, opts.npmGlobalNodeModules);
+  // 写入前的白名单校验（issue #20）：按**父目录**判定——父目录里已有非本扩展产物就跳过该目标。
+  // 典型受害目录是 DSH Desktop 的私有命令目录（只允许它自己的 dsh.cmd）：哪怕目标子目录
+  // 还不存在，只要往那里新建 `dsh-vscode-bridge/`，桌面下次启动就会硬失败。
+  const targets = allTargets.filter((t) => !shouldSkipForeignTarget(dirname(t), opts.fs));
   // primary 路径保持兼容语义（BridgeInstallResult.bridgeDir）
-  const bridgeDir = targets[0];
+  const bridgeDir = targets[0] ?? allTargets[0];
 
   let profileBundle: boolean;
   try {
@@ -175,10 +234,15 @@ export function installBridge(opts: BridgeInstallOptions): BridgeInstallResult {
   const existing = opts.fs.exists(patchPath) ? opts.fs.readFile(patchPath) : '';
 
   if (existing.includes(BRIDGE_BEGIN_MARK)) {
-    // 已存在条目：全部目标目录都必须可用（能读到含 `"name"` 的 package.json，
+    // 已存在条目：先把可能出现的重复副本自愈掉（issue #19——重复条目会让 DSH 插件树崩溃），
+    // 再做"全部目标目录都必须可用"的判定（能读到含 `"name"` 的 package.json，
     // 且版本与插件随附版本一致——版本不一致说明是升级前的旧包，需强制重装刷新）。
     // 仅 exists 会漏掉「目录在但 package.json 不可读」的坏包（chmod 000 事故），
     // 且 Windows 场景某目标缺失但其余完好时也需自愈补回。
+    const deduped = dedupeBridgeEntries(existing);
+    if (deduped !== existing) {
+      opts.fs.writeFile(patchPath, deduped);
+    }
     const wantVersion = bridgeVersion(opts.bridgeSourceDir, opts.fs);
     const unusable = targets.filter((t) => !isBridgeUsable(t, opts.fs, wantVersion, opts.bridgeSourceDir));
     if (unusable.length === 0) {
@@ -222,14 +286,61 @@ export function installBridge(opts: BridgeInstallOptions): BridgeInstallResult {
   return { status: 'ok', profileDir, bridgeDir };
 }
 
+/**
+ * 去掉重复的桥接条目，只保留第一段（issue #19）。
+ *
+ * 现场：多个 VS Code 窗口同时激活、或旧版本残留，会让 cordis.patch.yml 里出现两段
+ * `# dsh-vscode-bridge: begin/end`。DSH 侧同一 id 出现多条 insert 会让插件树崩溃
+ * （用户报告：必须手工删掉重复项才能进入）。这里做幂等自愈：保留首段、删除后续段落。
+ *
+ * @returns 去重后的 patch 文本；本来只有一段（或没有）时原样返回
+ */
+export function dedupeBridgeEntries(patch: string): string {
+  if (!patch.includes(BRIDGE_BEGIN_MARK)) return patch;
+  // 逐段提取 begin..end（含标记行本身）；用全局匹配定位所有段落
+  const segRe = new RegExp(
+    `${escapeRegExp(BRIDGE_BEGIN_MARK)}[^\\n]*\\n[\\s\\S]*?${escapeRegExp(BRIDGE_END_MARK)}[^\\n]*`,
+    'g',
+  );
+  const segs = patch.match(segRe);
+  if (segs === null || segs.length <= 1) return patch;
+  let out = patch;
+  // 从后往前删，避免前面的删除影响后续匹配到的位置
+  for (let i = segs.length - 1; i >= 1; i -= 1) {
+    out = out.replace(segs[i], '');
+  }
+  // 删段后可能留下多余空行：折叠连续 3 个以上换行，避免文件越来越"松散"
+  return out.replace(/\n{3,}/g, '\n\n').trimEnd() + '\n';
+}
+
+/** 转义正则特殊字符（用于把标记文本当字面量匹配） */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 /** 提取 Error 的 message（未知抛出物兜底为字符串化） */
 function errMsg(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+/** 其它 profile 仍注册桥接时保留共享副本；读取失败时也保留，避免破坏其它服务。 */
+function hasOtherBridgeProfile(opts: BridgeInstallOptions, profileDir: string): boolean {
+  const profilesDir = dirname(profileDir);
+  try {
+    return opts.fs.readdir(profilesDir).some((name) => {
+      const otherDir = join(profilesDir, name);
+      if (otherDir === profileDir) return false;
+      const patchPath = join(otherDir, 'cordis.patch.yml');
+      return opts.fs.exists(patchPath) && opts.fs.readFile(patchPath).includes(BRIDGE_BEGIN_MARK);
+    });
+  } catch {
+    return true;
+  }
+}
+
 /** 卸载：删除带标记的 insert: 条目段（其余内容原样保留）+ 删除桥接目录 */
 export function uninstallBridge(opts: BridgeInstallOptions): void {
-  const profileDir = detectProfileDir(opts.dshHome, opts.fs);
+  const profileDir = detectProfileDir(opts.dshHome, opts.fs, opts.profile);
   if (profileDir === null) return;
   try {
     if (isProfileBundle(profileDir, opts.fs)) return;
@@ -263,9 +374,11 @@ export function uninstallBridge(opts: BridgeInstallOptions): void {
     }
   }
   const targets = bridgeTargetDirs(profileDir, opts.npmGlobalNodeModules);
+  // 当前 profile 的私有副本始终删除，共享副本仅在最后一个使用者卸载后删除。
+  const removableTargets = hasOtherBridgeProfile(opts, profileDir) ? targets.slice(0, 1) : targets;
   // 全部目标目录删除均为尽力而为：权限锁死等场景下 rmDir 可能抛错，
   // 卸载的核心是回滚 patch 条目（保证 DSH 可干净启动），目录删除失败不应中断卸载。
-  for (const dir of targets) {
+  for (const dir of removableTargets) {
     if (opts.fs.exists(dir)) {
       try {
         opts.fs.rmDir(dir);
@@ -290,6 +403,14 @@ export function createNodeFs(): InstallerFs {
     copyDir: (src, dest) => nodeFs.cpSync(src, dest, { recursive: true }),
     rmDir: (p) => nodeFs.rmSync(p, { recursive: true, force: true }),
     readdir: (p) => nodeFs.readdirSync(p),
+    // lstat 不跟随链接：只有它才能识别出「profiles/linked -> 外部目录」这类条目
+    isSymlink: (p) => {
+      try {
+        return nodeFs.lstatSync(p).isSymbolicLink();
+      } catch {
+        return false; // 不存在/无权限：按非链接处理，后续 exists 检查会兜住
+      }
+    },
   };
 }
 

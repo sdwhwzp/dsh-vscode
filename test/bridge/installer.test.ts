@@ -9,6 +9,8 @@ import {
   detectProfileDir,
   createNodeFs,
   bridgeTargetDirs,
+  npmNodeModulesRootFrom,
+  shouldSkipForeignTarget,
   BRIDGE_BEGIN_MARK,
   BRIDGE_END_MARK,
   BRIDGE_BEGIN_MARK_WAS_EMPTY,
@@ -39,15 +41,20 @@ function makeMemFs(init: Record<string, string> = {}, copyPkgVersion?: string, c
       }
     },
     rmDir: (p) => { dirs.delete(p); for (const k of [...files.keys()]) { if (k.startsWith(`${p}/`)) files.delete(k); } },
-    readdir: () => [],
+    readdir: (p) => [...new Set([...files.keys(), ...dirs]
+      .filter((entry) => entry.startsWith(`${p}/`))
+      .map((entry) => entry.slice(p.length + 1).split('/')[0]))],
   };
 }
 
-test('detectProfileDir 返回 profiles/web 路径', () => {
+test('detectProfileDir 默认 web，支持自定义 profile 路径', () => {
   const fs = makeMemFs();
   fs.mkdir('/home/u/.dsh/profiles/web');
   assert.equal(detectProfileDir('/home/u/.dsh', fs), '/home/u/.dsh/profiles/web');
   assert.equal(detectProfileDir('/home/u/.dsh2', fs), null);
+  fs.mkdir('/home/u/.dsh/profiles/custom-profile');
+  assert.equal(detectProfileDir('/home/u/.dsh', fs, 'custom-profile'), '/home/u/.dsh/profiles/custom-profile');
+  assert.equal(detectProfileDir('/home/u/.dsh', fs, 'missing'), null);
 });
 
 test('DSH profile bundle is never overwritten or removed by extension installation', () => {
@@ -92,21 +99,27 @@ test('unreadable profile ownership degrades installation and preserves the bridg
   assert.doesNotThrow(() => uninstallBridge(opts));
 });
 
-test('installBridge 幂等：第二次安装不重复追加条目', () => {
-  const profile = '/home/u/.dsh/profiles/web';
-  const patchPath = `${profile}/cordis.patch.yml`;
-  const fs = makeMemFs({ [patchPath]: '# 用户自己的内容\n- id: user-plugin\n  name: user-plugin\n' });
-  fs.mkdir(profile);
-  const opts = { dshHome: '/home/u/.dsh', bridgeSourceDir: '/ext/bridge-client', fs };
-  const r1 = installBridge(opts);
-  const after1 = fs.readFile(patchPath);
-  const r2 = installBridge(opts);
-  assert.equal(r1.status, 'ok');
-  assert.equal(r2.status, 'ok');
-  assert.equal(fs.readFile(patchPath), after1); // 幂等
-  assert.ok(after1.includes(BRIDGE_BEGIN_MARK));
-  assert.ok(after1.includes('- id: dsh-vscode-bridge'));
-  assert.ok(after1.includes('# 用户自己的内容')); // 不覆盖用户内容
+test('installBridge 默认/自定义 profile 幂等：第二次安装不重复追加条目', () => {
+  for (const name of [undefined, 'web', 'custom-profile']) {
+    const profile = `/home/u/.dsh/profiles/${name ?? 'web'}`;
+    const patchPath = `${profile}/cordis.patch.yml`;
+    const fs = makeMemFs({ [patchPath]: '# 用户自己的内容\n- id: user-plugin\n  name: user-plugin\n' });
+    fs.mkdir(profile);
+    const opts = { dshHome: '/home/u/.dsh', profile: name, bridgeSourceDir: '/ext/bridge-client', fs };
+    const r1 = installBridge(opts);
+    const after1 = fs.readFile(patchPath);
+    const r2 = installBridge(opts);
+    assert.equal(r1.status, 'ok');
+    assert.equal(r1.profileDir, profile);
+    assert.equal(r1.bridgeDir, `${profile}/node_modules/dsh-vscode-bridge`);
+    for (const target of bridgeTargetDirs(profile)) assert.ok(fs.exists(target));
+    if (name === 'custom-profile') assert.equal(fs.exists('/home/u/.dsh/profiles/web/cordis.patch.yml'), false);
+    assert.equal(r2.status, 'ok');
+    assert.equal(fs.readFile(patchPath), after1); // 幂等
+    assert.ok(after1.includes(BRIDGE_BEGIN_MARK));
+    assert.ok(after1.includes('- id: dsh-vscode-bridge'));
+    assert.ok(after1.includes('# 用户自己的内容')); // 不覆盖用户内容
+  }
 });
 
 test('已装包版本与随附版本不一致：强制重装刷新为新版本', () => {
@@ -197,17 +210,19 @@ test('随附版本未知（源包不可读）：不比版本，可用即跳过�
   assert.equal(copies, afterFirst); // 无重装：复制次数不变
 });
 
-test('uninstallBridge 还原用户内容并删除桥接目录', () => {
-  const profile = '/home/u/.dsh/profiles/web';
-  const patchPath = `${profile}/cordis.patch.yml`;
-  const original = '# 用户自己的内容\n';
-  const fs = makeMemFs({ [patchPath]: original });
-  fs.mkdir(profile);
-  const opts = { dshHome: '/home/u/.dsh', bridgeSourceDir: '/ext/bridge-client', fs };
-  installBridge(opts);
-  uninstallBridge(opts);
-  assert.equal(fs.readFile(patchPath), original);
-  assert.equal(fs.exists(`${profile}/node_modules/dsh-vscode-bridge`), false);
+test('uninstallBridge 默认/自定义 profile 还原用户内容并删除桥接目录', () => {
+  for (const name of [undefined, 'web', 'custom-profile']) {
+    const profile = `/home/u/.dsh/profiles/${name ?? 'web'}`;
+    const patchPath = `${profile}/cordis.patch.yml`;
+    const original = '# 用户自己的内容\n';
+    const fs = makeMemFs({ [patchPath]: original });
+    fs.mkdir(profile);
+    const opts = { dshHome: '/home/u/.dsh', profile: name, bridgeSourceDir: '/ext/bridge-client', fs };
+    installBridge(opts);
+    uninstallBridge(opts);
+    assert.equal(fs.readFile(patchPath), original);
+    assert.equal(fs.exists(`${profile}/node_modules/dsh-vscode-bridge`), false);
+  }
 });
 
 test('profile 目录缺失时返回 degraded 并带原因', () => {
@@ -215,6 +230,9 @@ test('profile 目录缺失时返回 degraded 并带原因', () => {
   const r = installBridge({ dshHome: '/home/u/.dsh', bridgeSourceDir: '/ext/bridge-client', fs });
   assert.equal(r.status, 'degraded');
   assert.ok(r.reason);
+  const custom = installBridge({ dshHome: '/home/u/.dsh', profile: 'custom-profile', bridgeSourceDir: '/ext/bridge-client', fs });
+  assert.equal(custom.status, 'degraded');
+  assert.equal(custom.reason, 'custom-profile profile not found');
 });
 
 test('[] 空数组场景：安装改写为块序列，卸载还原为 []', () => {
@@ -476,7 +494,7 @@ test('幂等分支 secondary 缺失（dsh 升级清理 fallback）→ 自愈补�
   assert.equal(fs.readFile(`${primary}/package.json`), primaryPkg);
 });
 
-test('uninstallBridge：两处目录均删除', () => {
+test('uninstallBridge：最后一个 profile 卸载后删除共享副本', () => {
   const profile = '/home/u/.dsh/profiles/web';
   const patchPath = `${profile}/cordis.patch.yml`;
   const original = '# 用户自己的内容\n';
@@ -490,6 +508,32 @@ test('uninstallBridge：两处目录均删除', () => {
   uninstallBridge(opts);
   assert.equal(fs.exists(primary), false);
   assert.equal(fs.exists(secondary), false);
+  // 多 profile 共用 fallback 副本：先卸载其中一个，另一个仍能正常解析桥接。
+  for (const first of ['web', 'custom-profile']) {
+    const sharedFs = makeMemFs();
+    const dshHome = '/home/u/.dsh';
+    const npmGlobalNodeModules = '/npm/node_modules';
+    const common = { dshHome, bridgeSourceDir: '/ext/bridge-client', fs: sharedFs, npmGlobalNodeModules };
+    for (const name of ['web', 'custom-profile']) {
+      sharedFs.mkdir(`${dshHome}/profiles/${name}`);
+      installBridge({ ...common, profile: name });
+    }
+    const other = first === 'web' ? 'custom-profile' : 'web';
+    const firstDir = `${dshHome}/profiles/${first}`;
+    const otherDir = `${dshHome}/profiles/${other}`;
+    const otherPatch = sharedFs.readFile(`${otherDir}/cordis.patch.yml`);
+    uninstallBridge({ ...common, profile: first });
+    assert.equal(sharedFs.exists(bridgeTargetDirs(firstDir)[0]), false);
+    assert.equal(sharedFs.readFile(`${firstDir}/cordis.patch.yml`), '[]\n');
+    assert.equal(sharedFs.readFile(`${otherDir}/cordis.patch.yml`), otherPatch);
+    for (const target of bridgeTargetDirs(otherDir, npmGlobalNodeModules)) {
+      assert.ok(sharedFs.exists(target), `${target} 应保留`);
+    }
+    uninstallBridge({ ...common, profile: other });
+    for (const target of bridgeTargetDirs(otherDir, npmGlobalNodeModules)) {
+      assert.equal(sharedFs.exists(target), false);
+    }
+  }
 });
 
 // —— 第三安装目标：npm 全局 node_modules（Windows 扩展宿主 ESM 解析可达位置）——
@@ -600,4 +644,162 @@ test('不传 npmGlobalNodeModules：目标数组仅两项，与旧双位置行�
     '/home/u/.dsh/profiles/web/node_modules/dsh-vscode-bridge',
     '/home/u/.dsh/profiles/node_modules/dsh-vscode-bridge',
   ]);
+});
+
+// ——— issue #20：安装目标不得写进第三方私有目录 ———
+test('npmNodeModulesRootFrom：从包内 bin.js 上溯到 node_modules 根', () => {
+  // DSH Desktop 场景（issue #20 报告的配置）
+  assert.equal(
+    npmNodeModulesRootFrom('C:\\App\\DSH Desktop\\resources\\app.asar.unpacked\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js'),
+    'C:\\App\\DSH Desktop\\resources\\app.asar.unpacked\\node_modules',
+  );
+  // npm 全局安装（pnpm/npm 包内入口）
+  assert.equal(
+    npmNodeModulesRootFrom('C:\\Users\\u\\AppData\\Roaming\\npm\\node_modules\\@deepseek-ai\\dsh\\lib\\bin.js'),
+    'C:\\Users\\u\\AppData\\Roaming\\npm\\node_modules',
+  );
+  // 路径中没有 node_modules 段 → 放弃该目标（宁可只装 profiles 双位置）
+  assert.equal(npmNodeModulesRootFrom('C:\\tools\\dsh\\lib\\bin.js'), undefined);
+});
+
+test('shouldSkipForeignTarget：判据是「父目录含命令垫片(.cmd)」而不是「父目录有他人条目」', () => {
+  // 父目录不存在 → 可写
+  const empty = { exists: () => false, readdir: () => [] };
+  assert.equal(shouldSkipForeignTarget('C:\\any\\node_modules', empty), false);
+});
+
+test('shouldSkipForeignTarget：node_modules 里有一堆别人的包也要放行（回归防线）', () => {
+  // 真实场景：~/.dsh/profiles/node_modules 里有 180+ 个 DSH 依赖包，但桥接本来就该装在这里。
+  // 曾用"父目录含非本扩展条目就跳过"的判据，导致 secondary 位置的桥接永远刷不了新版本。
+  const npmLike = {
+    exists: () => true,
+    readdir: () => ['@babel', '@aws-sdk', '@deepseek-ai', 'express', 'ws', BRIDGE_PACKAGE_NAME],
+  };
+  assert.equal(shouldSkipForeignTarget('C:\\Users\\u\\.dsh\\profiles\\node_modules', npmLike), false);
+  assert.equal(shouldSkipForeignTarget('/home/u/.dsh/profiles/node_modules', npmLike), false);
+});
+
+test('shouldSkipForeignTarget：父目录含 .cmd 命令垫片 → 跳过（issue #20 的受害目录）', () => {
+  // 复刻 %APPDATA%\DSH Desktop\host-commands\desktop\bin：被桌面独占，只允许它自己的 dsh.cmd
+  const victim = { exists: () => true, readdir: () => ['dsh.cmd'] };
+  assert.equal(shouldSkipForeignTarget('C:\\Users\\u\\AppData\\Roaming\\DSH Desktop\\host-commands\\desktop\\bin', victim), true);
+  // 大小写不敏感（Windows 实际可能给 .CMD）
+  const upper = { exists: () => true, readdir: () => ['DSH.CMD'] };
+  assert.equal(shouldSkipForeignTarget('C:\\somewhere\\bin', upper), true);
+});
+
+test('shouldSkipForeignTarget：父目录不可读 → 保守跳过（不冒写坏他人目录的风险）', () => {
+  const boom = {
+    exists: () => true,
+    readdir: () => { throw new Error('EACCES'); },
+  };
+  assert.equal(shouldSkipForeignTarget('C:\\locked\\node_modules', boom), true);
+});
+
+test('installBridge：父目录被他人占用时不写入其子目录（issue #20 的核心场景）', () => {
+  // 端到端复刻：目标 `…/desktop/bin/dsh-vscode-bridge` 不存在，但父目录 `…/desktop/bin` 里有 dsh.cmd。
+  // 修复前会新建子目录（污染宿主私有目录）；修复后必须跳过。
+  const profile = '/home/u/.dsh/profiles/web';
+  const patchPath = `${profile}/cordis.patch.yml`;
+  const desktopBin = 'C:\\Users\\u\\AppData\\Roaming\\DSH Desktop\\host-commands\\desktop\\bin';
+  const memFs = makeMemFs({ [patchPath]: '[]\n' });
+  memFs.mkdir(profile);
+  const fs: InstallerFs = {
+    ...memFs,
+    exists: (p) => (p === desktopBin ? true : memFs.exists(p)),
+    readdir: (p) => (p === desktopBin ? ['dsh.cmd'] : memFs.readdir(p)),
+  };
+
+  const r = installBridge({
+    dshHome: '/home/u/.dsh',
+    bridgeSourceDir: '/ext/bridge-client',
+    fs,
+    npmGlobalNodeModules: desktopBin,
+  });
+  assert.equal(r.status, 'ok');
+  assert.ok(memFs.exists(`${profile}/node_modules/dsh-vscode-bridge/package.json`), 'profiles 位置照常安装');
+  assert.equal(memFs.exists(`${desktopBin}\\dsh-vscode-bridge/package.json`), false, '不得在宿主私有目录里新建条目');
+  assert.equal(fs.readdir(desktopBin).length, 1, '宿主目录条目数不变');
+});
+
+test('installBridge：npm 目标目录含他人产物时跳过该目标，其余位置照常安装（issue #20）', () => {
+  const profile = '/home/u/.dsh/profiles/web';
+  const patchPath = `${profile}/cordis.patch.yml`;
+  const desktopBin = 'C:\\Users\\u\\AppData\\Roaming\\DSH Desktop\\host-commands\\desktop\\bin';
+  const desktopBinBridge = `${desktopBin}\\dsh-vscode-bridge`;
+  const memFs = makeMemFs({ [patchPath]: '[]\n' });
+  memFs.mkdir(profile);
+  // 模拟真实受害目录：父目录里只有桌面自己的 dsh.cmd（子目录不存在）
+  const fs: InstallerFs = {
+    ...memFs,
+    exists: (p) => (p === desktopBin ? true : memFs.exists(p)),
+    readdir: (p) => (p === desktopBin ? ['dsh.cmd'] : memFs.readdir(p)),
+  };
+
+  const r = installBridge({
+    dshHome: '/home/u/.dsh',
+    bridgeSourceDir: '/ext/bridge-client',
+    fs,
+    npmGlobalNodeModules: desktopBin,
+  });
+  assert.equal(r.status, 'ok');
+  // profiles 双位置照常安装
+  assert.ok(memFs.exists(`${profile}/node_modules/dsh-vscode-bridge/package.json`));
+  assert.ok(memFs.exists('/home/u/.dsh/profiles/node_modules/dsh-vscode-bridge/package.json'));
+  // 第三方私有目录未被写入：memfs 的 copyDir 会在此路径落 package.json，不存在即证明被跳过
+  assert.equal(memFs.exists(`${desktopBinBridge}/package.json`), false);
+});
+
+// ——— issue #19：cordis.patch.yml 的桥接条目不得重复（重复会让插件树崩溃） ———
+test('installBridge 对含重复桥接条目的 patch 自愈去重（issue #19）', () => {
+  const profile = '/home/u/.dsh/profiles/web';
+  const patchPath = `${profile}/cordis.patch.yml`;
+  const block = [
+    `${BRIDGE_BEGIN_MARK}`,
+    '- insert:',
+    `    - id: ${BRIDGE_PACKAGE_NAME}`,
+    `      name: ${BRIDGE_PACKAGE_NAME}`,
+    `${BRIDGE_END_MARK}`,
+  ].join('\n');
+  // 复刻用户现场：同一段条目被追加了两次
+  const fs = makeMemFs({ [patchPath]: `# 用户自己的内容\n- id: user-plugin\n  name: user-plugin\n\n${block}\n\n${block}\n` });
+  fs.mkdir(profile);
+
+  const r = installBridge({ dshHome: '/home/u/.dsh', bridgeSourceDir: '/ext/bridge-client', fs });
+  assert.equal(r.status, 'ok');
+  const after = fs.readFile(patchPath);
+  // 只保留一份 begin 标记
+  assert.equal(after.split(BRIDGE_BEGIN_MARK).length - 1, 1, '重复条目应被去重');
+  assert.equal(after.split(BRIDGE_END_MARK).length - 1, 1);
+  // 用户自己的内容不能被动
+  assert.ok(after.includes('user-plugin'));
+});
+
+test('installBridge 并发/重复调用不产生重复条目（issue #19）', () => {
+  const profile = '/home/u/.dsh/profiles/web';
+  const patchPath = `${profile}/cordis.patch.yml`;
+  const fs = makeMemFs({ [patchPath]: '# 用户插件\n- id: u\n  name: u\n' });
+  fs.mkdir(profile);
+  const opts = { dshHome: '/home/u/.dsh', bridgeSourceDir: '/ext/bridge-client', fs };
+  // 模拟两个扩展宿主（多个 VS Code 窗口）几乎同时安装
+  const r1 = installBridge(opts);
+  const r2 = installBridge(opts);
+  assert.equal(r1.status, 'ok');
+  assert.equal(r2.status, 'ok');
+  const after = fs.readFile(patchPath);
+  assert.equal(after.split(BRIDGE_BEGIN_MARK).length - 1, 1, '两次安装后仍只应有一条桥接条目');
+  assert.ok(after.includes('id: u'), '用户插件条目保留');
+});
+
+test('installBridge 在 patch 为默认空数组模板时也只写一条条目（issue #19）', () => {
+  const profile = '/home/u/.dsh/profiles/web';
+  const patchPath = `${profile}/cordis.patch.yml`;
+  const fs = makeMemFs({ [patchPath]: '# 注释头\n# 再一行\n[]\n' });
+  fs.mkdir(profile);
+  const opts = { dshHome: '/home/u/.dsh', bridgeSourceDir: '/ext/bridge-client', fs };
+  installBridge(opts);
+  installBridge(opts);
+  const after = fs.readFile(patchPath);
+  assert.equal(after.split(BRIDGE_BEGIN_MARK).length - 1, 1);
+  assert.ok(after.includes('# 注释头'), '头部注释保留（卸载时才能字节级还原）');
 });

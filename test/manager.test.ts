@@ -52,6 +52,7 @@ interface Harness {
   probeQueue: ProbeResult[];   // 探测结果队列，取完后循环最后一个
   child: FakeChild | null;
   spawnCount: number;
+  spawnProfiles: (string | undefined)[];
   spawnOpenInBrowser: boolean[]; // 每次 startDsh 传入的 openInBrowser（用于断言 --no-open 兜底）
   probeCount: number;           // 探测调用次数，用于断言定时器已清理
   states: string[];             // 记录状态变化序列
@@ -63,6 +64,7 @@ function makeHarness(opts?: Partial<Parameters<ServiceManager['reconfigure']>[0]
     probeQueue: [],
     child: null,
     spawnCount: 0,
+    spawnProfiles: [],
     spawnOpenInBrowser: [],
     probeCount: 0,
     states: [],
@@ -74,6 +76,7 @@ function makeHarness(opts?: Partial<Parameters<ServiceManager['reconfigure']>[0]
   const processRunner: ProcessRunner = {
     startDsh: (o) => {
       h.spawnCount += 1;
+      h.spawnProfiles.push(o.profile);
       h.spawnOpenInBrowser.push(o?.openInBrowser ?? false);
       h.child = new FakeChild();
       return h.child;
@@ -89,9 +92,12 @@ function makeHarness(opts?: Partial<Parameters<ServiceManager['reconfigure']>[0]
   h.manager = new ServiceManager(
     {
       host: '127.0.0.1', port: 3080, extraArgs: [], autoStart: true,
-      timeoutMs: 100, pollMs: 5, ...opts,
+      timeoutMs: 100, pollMs: 5,
+      // 测试统一用很短的启动超时（50ms）：默认 45s 会让超时用例等太久（issue #23 起可配）
+      startTimeoutMs: 50,
+      ...opts,
     },
-    { probeService, processRunner, log: () => {}, startTimeoutMs: 50, ...depsOpts },
+    { probeService, processRunner, log: () => {}, ...depsOpts },
   );
   h.manager.onChange((s) => h.states.push(s.state));
   return h;
@@ -189,7 +195,32 @@ test('启动超时：failed + err.startTimeout', async () => {
   const s = await h.manager.ensureRunning();
   assert.equal(s.state, 'failed');
   assert.equal(s.error, 'err.startTimeout');
-  assert.equal(s.errorVars?.seconds, 0); // startTimeoutMs=50 → round(50/1000)=0（真实环境为 15 秒）
+  assert.equal(s.errorVars?.seconds, 0); // startTimeoutMs=50 → round(50/1000)=0（dsh.startTimeoutMs 默认 45 秒）
+  h.manager.dispose();
+});
+
+// ——— issue #23：启动总超时可配（默认 45s，可经 dsh.startTimeoutMs 调整） ———
+test('启动超时可经 ManagerOptions.startTimeoutMs 配置（issue #23）', async () => {
+  // harness 默认 50ms；这里用 options 覆盖成 2500ms，验证配置真的驱动超时判定与文案秒数
+  const h = makeHarness({ startTimeoutMs: 2500 });
+  h.probeQueue = ['down'];
+  const s = await h.manager.ensureRunning();
+  assert.equal(s.state, 'failed');
+  assert.equal(s.error, 'err.startTimeout');
+  // 报错文案里的秒数取自生效的超时值：2500ms → 3 秒（round 到最近整数秒）
+  assert.equal(s.errorVars?.seconds, 3);
+  h.manager.dispose();
+});
+
+test('ManagerOptions.startTimeoutMs 优先于 deps 注入值（配置必须能覆盖测试默认）', async () => {
+  // 语义：配置（options）优先，deps 只作默认。
+  // 反向实现（deps 优先）会让 dsh.startTimeoutMs 永远不生效——issue #23 实现时踩过。
+  const h = makeHarness({ startTimeoutMs: 1500 }, { startTimeoutMs: 600 });
+  h.probeQueue = ['down'];
+  const s = await h.manager.ensureRunning();
+  assert.equal(s.state, 'failed');
+  assert.equal(s.error, 'err.startTimeout');
+  assert.equal(s.errorVars?.seconds, 2); // options 的 1500ms 生效（round→2），而非 deps 的 600ms（round→1）
   h.manager.dispose();
 });
 
@@ -353,18 +384,32 @@ test('ensureRunning 并发幂等：只 spawn 一次', async () => {
   h.manager.dispose();
 });
 
-test('reconfigure 换端口：自启服务先停再按新端口启动', async () => {
+test('reconfigure 换端口或 profile：自启服务按新目标重启', async () => {
+  for (const target of [{ port: 4000 }, { profile: 'custom-profile' }]) {
+    const h = makeHarness();
+    h.probeQueue = ['down', 'dsh'];
+    await h.manager.ensureRunning();
+    assert.deepEqual(h.spawnProfiles, [undefined]);
+    const oldChild = h.child!;
+    h.probeQueue = ['down', 'dsh'];
+    const s = await h.manager.reconfigure({
+      host: '127.0.0.1', port: 3080, extraArgs: [], autoStart: true, timeoutMs: 100, pollMs: 5,
+      ...target,
+    });
+    assert.equal(s.state, 'ready');
+    assert.ok(oldChild.killed.length > 0);
+    assert.equal(h.manager.getTarget().port, target.port ?? 3080);
+    assert.equal(h.spawnCount, 2);
+    assert.equal(h.spawnProfiles[1], target.profile);
+    h.manager.dispose();
+  }
   const h = makeHarness();
   h.probeQueue = ['down', 'dsh'];
   await h.manager.ensureRunning();
-  const oldChild = h.child!; // 捕获旧子进程引用（reconfigure 重启后 h.child 会指向新子进程）
-  h.probeQueue = ['down', 'dsh'];
-  const s = await h.manager.reconfigure({
-    host: '127.0.0.1', port: 4000, extraArgs: [], autoStart: true, timeoutMs: 100, pollMs: 5,
+  await h.manager.reconfigure({
+    profile: 'web', host: '127.0.0.1', port: 3080, extraArgs: [], autoStart: true, timeoutMs: 100, pollMs: 5,
   });
-  assert.equal(s.state, 'ready');
-  assert.ok(oldChild.killed.length > 0); // 旧服务确实被停止（SIGTERM+SIGKILL）
-  assert.equal(h.manager.getTarget().port, 4000);
+  assert.equal(h.spawnCount, 1, '回退到默认 web 不应重启服务');
   h.manager.dispose();
 });
 
@@ -561,5 +606,22 @@ test('stdout 日志打码 token（日志零明文），onLaunchUrl 回调仍收�
   h.manager.dispose();
 });
 
+// ——— issue #23：设置项改动后超时值必须立即生效（走 reconfigure 路径） ———
+test('reconfigure 会同步新的 startTimeoutMs（改设置后无需重载窗口）', async () => {
+  const h = makeHarness({ startTimeoutMs: 50 });
+  h.probeQueue = ['down'];
+  const before = await h.manager.ensureRunning();
+  assert.equal(before.error, 'err.startTimeout');
+  assert.equal(before.errorVars?.seconds, 0); // 50ms → round→0
 
-
+  // 模拟用户在设置里把超时改成 1500ms 后触发的配置变更
+  await h.manager.reconfigure({
+    host: '127.0.0.1', port: 3080, extraArgs: [], autoStart: true,
+    timeoutMs: 100, pollMs: 5, startTimeoutMs: 1500,
+  });
+  h.probeQueue = ['down'];
+  const after = await h.manager.ensureRunning();
+  assert.equal(after.error, 'err.startTimeout');
+  assert.equal(after.errorVars?.seconds, 2, '新超时值应已生效（1500ms → round→2）');
+  h.manager.dispose();
+});
